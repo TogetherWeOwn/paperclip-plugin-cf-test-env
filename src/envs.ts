@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { CfClient, isAuthFailure, type FetchImpl } from "./cloudflare.js";
+import { CfClient, isAuthenticationFailure, type FetchImpl } from "./cloudflare.js";
 import { checkProvisionAllowed, type CfTestEnvConfig } from "./config.js";
 import { ENV_DOC_KEY } from "./manifest.js";
 import {
@@ -335,7 +335,15 @@ export async function provision(
     // Roll back in teardown order — revoke the token first — then rethrow.
     // When rollback is clean there is nothing for the sweep to do, so the
     // provisioning record is dropped; otherwise it is kept for the sweep.
-    const rollbackErrors = await rollbackPartial(cf, progress);
+    //
+    // If provisioning itself died with a 401, the credential or IP filter is
+    // dead and every rollback call would 401 too (same credential, same host,
+    // same filter), so no rollback call is attempted — one deterministic
+    // failure must not become several. The kept record lets the hourly sweep
+    // retry once the operator fixes the credential or filter.
+    const rollbackErrors = isAuthenticationFailure(err)
+      ? ["rollback skipped after an authentication failure; resources kept for the sweep"]
+      : await rollbackPartial(cf, progress);
     if (rollbackErrors.length === 0) {
       await ctx.state.delete(envKey(run.companyId, envId));
       await removeFromIndex(ctx, run.companyId, envId);
@@ -351,8 +359,10 @@ export async function provision(
 /**
  * Best-effort rollback of a partial provision, in teardown order. Returns the
  * step errors (empty when everything was undone). Aborts the remaining steps
- * on the first auth failure: every further call would 401/403 too, and
+ * on the first 401: every further call would fail the same way, and
  * Cloudflare locks the caller out after repeated authentication failures.
+ * A 403 is recorded as an ordinary step error and the remaining steps still
+ * run — it is resource-specific, not a dead credential.
  */
 async function rollbackPartial(cf: CfClient, progress: ProvisioningRecord): Promise<string[]> {
   const errors: string[] = [];
@@ -363,7 +373,7 @@ async function rollbackPartial(cf: CfClient, progress: ProvisioningRecord): Prom
       await fn();
     } catch (err) {
       errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
-      if (isAuthFailure(err)) authFailed = true;
+      if (isAuthenticationFailure(err)) authFailed = true;
     }
   };
   if (progress.tokenId) {
@@ -453,10 +463,11 @@ export async function d1Execute(
  * converge; a bucket that never empties fails loudly and keeps state.
  */
 export async function emptyBucket(cf: CfClient, bucket: string): Promise<void> {
-  // No retries here: any Cloudflare error (in particular a 401/403 auth
-  // failure) propagates immediately instead of looping. The round loop below
-  // only repeats after a fully successful snapshot-and-delete pass that still
-  // finds objects (concurrent adds) — it never retries a failed call.
+  // No retries here: any Cloudflare error (in particular a 401
+  // authentication failure) propagates immediately instead of looping. The
+  // round loop below only repeats after a fully successful snapshot-and-delete
+  // pass that still finds objects (concurrent adds) — it never retries a
+  // failed call.
   for (let round = 0; round < 10; round++) {
     const keys: string[] = [];
     let cursor: string | undefined;
@@ -498,9 +509,10 @@ export async function teardown(
   const errors: string[] = [];
   const raw = await readAnyEnv(ctx, companyId, envId);
   if (!raw) return { errors, authFailed: false };
-  // Set on the first 401/403: every further Cloudflare call would fail the
-  // same way, and Cloudflare locks the caller out after repeated
-  // authentication failures — so the steps below stop instead of looping.
+  // Set on the first 401: every further Cloudflare call would fail the same
+  // way, and Cloudflare locks the caller out after repeated authentication
+  // failures — so the steps below stop instead of looping. A 403 is recorded
+  // as an ordinary step error and the remaining steps still run.
   let authFailed = false;
   if (run) {
     await authorizeEnvCaller(ctx, config, { agentId: run.agentId, companyId }, raw);
@@ -519,7 +531,7 @@ export async function teardown(
       await fn();
     } catch (err) {
       errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
-      if (isAuthFailure(err)) authFailed = true;
+      if (isAuthenticationFailure(err)) authFailed = true;
     }
   };
 

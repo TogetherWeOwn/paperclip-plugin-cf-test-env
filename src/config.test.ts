@@ -51,6 +51,17 @@ describe("checkProvisionAllowed", () => {
     expect(checkProvisionAllowed(resolveConfig({ ...base, allowedProjectIds: [] }), { projectId: "proj-kofra", liveCount: 0 })?.code).toBe("project_not_allowed");
   });
 
+  it("rejects a blank egress entry instead of minting a single-family token", () => {
+    // ["v4", " "] must fail closed: silently dropping the blank would mint a
+    // token missing an egress family.
+    const blank = resolveConfig({ ...base, egressCidrs: ["203.0.113.10/32", " "] });
+    expect(blank.egressCidrs).toEqual(["203.0.113.10/32", ""]);
+    expect(
+      checkProvisionAllowed(blank, { projectId: "proj-kofra", liveCount: 0 })?.code,
+    ).toBe("not_configured");
+    expect(checkProvisionAllowed(resolveConfig(base), { projectId: "proj-kofra", liveCount: 0 })).toBeNull();
+  });
+
   it("merges a legacy single egressCidr into the list and dedupes", () => {
     expect(resolveConfig(base).egressCidrs).toEqual([
       "203.0.113.10/32",

@@ -41,6 +41,12 @@ export class FakeCf {
    */
   failWithAuthOn: string[] = [];
   /**
+   * Entries of the form "METHOD path-substring": matching calls fail with
+   * 403, simulating a resource-specific permission problem. Unlike a 401 this
+   * must NOT abort the remaining cleanup or starve the rest of the sweep.
+   */
+  failWithForbiddenOn: string[] = [];
+  /**
    * When true, reading a token back returns its stored body with the
    * `condition` stripped — simulating an API that silently drops an
    * unrecognised condition key. Provision must revoke and fail closed.
@@ -95,6 +101,9 @@ export class FakeCf {
     }
     if (this.failWithAuthOn.some((rule) => `${method} ${path}`.includes(rule))) {
       return apiError(401, `injected auth failure for ${method} ${path}`);
+    }
+    if (this.failWithForbiddenOn.some((rule) => `${method} ${path}`.includes(rule))) {
+      return apiError(403, `injected forbidden failure for ${method} ${path}`);
     }
 
     // Workers scripts

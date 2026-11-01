@@ -206,6 +206,23 @@ describe("provision", () => {
     }
   });
 
+  it("skips rollback calls when provisioning itself dies with a 401", async () => {
+    // Same credential, same host, same filter: every rollback call would 401
+    // too, so none is attempted — one deterministic failure must not become
+    // several. The record is kept for the hourly sweep.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.failWithAuthOn = ["POST /accounts/acct-1/d1/database"];
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/rollback skipped/);
+    // The Worker created before the 401 is recorded but untouched: no DELETE
+    // was attempted, and the provisioning record stays for the sweep.
+    expect(fake.calls.some((c) => c.method === "DELETE")).toBe(false);
+    expect(fake.scripts.size).toBe(1);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
   it("revokes a minted token when a later step fails", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const upsert = harness.ctx.issues.documents.upsert.bind(harness.ctx.issues.documents);
@@ -470,6 +487,25 @@ describe("teardown", () => {
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
   });
 
+  it("records a 403 but continues the remaining cleanup instead of aborting", async () => {
+    // A 403 is resource-specific, not a dead credential: the remaining steps
+    // still run, and the sweep must not treat it as fatal.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const provisioned = await provision(ctxOf(harness), config, run, { issueId: issue.id }, deps);
+    fake.failWithForbiddenOn = ["DELETE /accounts/acct-1/d1/database"];
+    const { errors, authFailed } = await teardown(ctxOf(harness), config, COMPANY, provisioned.envId, deps);
+    expect(authFailed).toBe(false);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("delete d1");
+    // Cleanup continued past the forbidden D1: Worker, KV and R2 are gone.
+    expect(fake.scripts.has(provisioned.workerName)).toBe(false);
+    expect(fake.namespaces.size).toBe(0);
+    expect(fake.buckets.has(provisioned.workerName)).toBe(false);
+    // The error keeps the record for retry.
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
   it("empties multi-page buckets with per-object deletes", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const config = resolveConfig({ ...baseConfig });
@@ -515,6 +551,22 @@ describe("sweep and issue.updated", () => {
     expect(fake.scripts.has(first.workerName)).toBe(true);
     expect(fake.scripts.has(second.workerName)).toBe(true);
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(2);
+  });
+
+  it("tears down later envs even when an earlier env keeps 403ing", async () => {
+    // A 403 is resource-specific: one stuck env must not starve the rest of
+    // the sweep the way a 401 (dead credential) does.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const old = { ...deps, nowMs: NOW - 5 * 3600 * 1000 };
+    const first = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "111111" });
+    const second = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "222222" });
+    fake.failWithForbiddenOn = [`DELETE /accounts/acct-1/r2/buckets/${first.workerName}`];
+    const result = await sweep(ctxOf(harness), config, COMPANY, { ...deps, nowMs: NOW });
+    expect(result.tornDown).toEqual([second.envId]);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0]).toContain(first.envId);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
   });
 
   it("tears down envs whose card is done", async () => {

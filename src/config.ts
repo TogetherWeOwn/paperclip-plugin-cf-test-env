@@ -57,11 +57,14 @@ export function resolveConfig(raw: Record<string, unknown>): CfTestEnvConfig {
   const prefix =
     typeof raw.namePrefix === "string" && raw.namePrefix.length > 0 ? raw.namePrefix : DEFAULT_NAME_PREFIX;
   // `egressCidrs` (list) is canonical; a legacy single `egressCidr` string is
-  // merged in so configs written before the list existed keep working.
+  // merged in so configs written before the list existed keep working. Blank
+  // entries are preserved, not dropped: a blank is an operator typo, and
+  // silently dropping it would mint a token missing an egress family. The
+  // gate below rejects blank entries fail-closed.
   const legacy = typeof raw.egressCidr === "string" ? raw.egressCidr.trim() : "";
-  const cidrs = [legacy, ...stringArray(raw.egressCidrs)]
+  const cidrs = [...(legacy ? [legacy] : []), ...stringArray(raw.egressCidrs)]
     .map((c) => c.trim())
-    .filter((c, i, a) => c.length > 0 && a.indexOf(c) === i);
+    .filter((c, i, a) => a.indexOf(c) === i);
   return {
     tokenSecretRef: isSecretRefBinding(raw.tokenSecretRef) ? raw.tokenSecretRef : null,
     accountId: typeof raw.accountId === "string" ? raw.accountId.trim() : "",
@@ -106,6 +109,12 @@ export function checkProvisionAllowed(
 ): ConfigError | null {
   if (!config.tokenSecretRef || !config.accountId || config.egressCidrs.length === 0) {
     return { code: "not_configured", message: "cf-test-env is not configured; cannot provision." };
+  }
+  if (config.egressCidrs.some((c) => c.length === 0)) {
+    return {
+      code: "not_configured",
+      message: "cf-test-env egress CIDR list contains a blank entry; refusing to guess the intended filter.",
+    };
   }
   if (!config.workerAdminGroupId || !config.r2ItemWriteGroupId) {
     return {

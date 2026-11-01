@@ -55,11 +55,14 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
   appear in the run transcript, bounded by its short TTL and IP filter.
 - Teardown revokes the token before deleting resources, so a leaked token
   dies even if deletion fails.
-- Auth failures (401/403) are never retried or looped over: rollback,
-  teardown and the sweep abort their remaining Cloudflare calls on the first
-  one, because Cloudflare locks the caller out after repeated authentication
-  failures. A token whose IP filter misses an egress family 401s on it, which
-  is why `egressCidrs` must cover both IPv4 and IPv6.
+- A 401 (dead credential or an IP filter that misses an egress family) is
+  never retried or looped over: rollback is skipped, teardown aborts its
+  remaining calls, and the sweep stops, because Cloudflare locks the caller
+  out after repeated authentication failures. A 403 is resource-specific and
+  is recorded as an ordinary error so one forbidden resource neither aborts
+  its env's remaining cleanup nor starves the rest of the sweep. This is why
+  `egressCidrs` must cover both IPv4 and IPv6 — and why a blank entry is
+  rejected instead of silently dropped.
 - Tests use an in-memory Cloudflare fixture (`src/test-support/fake-cf.ts`);
   no real Cloudflare calls run in CI.
 - Canary (merge gate): the operator verifies a minted token can run

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CfClient, CfError, isAuthFailure } from "./cloudflare.js";
+import { CfClient, CfError, isAuthenticationFailure } from "./cloudflare.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 describe("CfClient", () => {
@@ -152,12 +152,14 @@ describe("CfClient", () => {
     expect(err.body).toBe("forbidden");
   });
 
-  it("flags 401/403 as auth failures that callers must not retry", () => {
-    expect(isAuthFailure(new CfError(401, "unauthorized", "nope"))).toBe(true);
-    expect(isAuthFailure(new CfError(403, "forbidden", "nope"))).toBe(true);
-    expect(isAuthFailure(new CfError(404, "missing", "nope"))).toBe(false);
-    expect(isAuthFailure(new CfError(500, "boom", "nope"))).toBe(false);
-    expect(isAuthFailure(new Error("boom"))).toBe(false);
+  it("flags only 401 as an authentication failure that stops all further calls", () => {
+    expect(isAuthenticationFailure(new CfError(401, "unauthorized", "nope"))).toBe(true);
+    // A 403 is a resource-specific permission problem, not a dead credential:
+    // callers record it and continue instead of aborting the sweep.
+    expect(isAuthenticationFailure(new CfError(403, "forbidden", "nope"))).toBe(false);
+    expect(isAuthenticationFailure(new CfError(404, "missing", "nope"))).toBe(false);
+    expect(isAuthenticationFailure(new CfError(500, "boom", "nope"))).toBe(false);
+    expect(isAuthenticationFailure(new Error("boom"))).toBe(false);
   });
 
   it("reads worker metadata and returns null for missing scripts", async () => {

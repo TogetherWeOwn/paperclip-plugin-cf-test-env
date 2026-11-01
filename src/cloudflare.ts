@@ -22,15 +22,22 @@ export class CfError extends Error {
 }
 
 /**
- * True for Cloudflare auth failures (bad/expired token, or a request.ip
- * filter that doesn't cover the caller). Cloudflare locks the caller out
- * after repeated authentication failures, so no caller may retry or loop
- * over calls that fail this way: `emptyBucket`, `rollbackPartial`,
- * `teardown` and `sweep` all abort their remaining Cloudflare calls on the
- * first auth failure and surface it instead.
+ * True for Cloudflare authentication failures (bad/expired credential, or a
+ * request.ip filter that doesn't cover the caller — the canary showed filter
+ * violations surface as 401). Cloudflare locks the caller out after repeated
+ * authentication failures, so no caller may retry or loop over calls that
+ * fail this way: `emptyBucket`, `rollbackPartial`, `teardown` and `sweep`
+ * all abort their remaining Cloudflare calls on the first 401 and surface it
+ * instead.
+ *
+ * A 403 is deliberately NOT covered: it means the credential authenticated
+ * but is forbidden for that operation, which is resource-specific (and does
+ * not feed the lockout counter). 403s are recorded as ordinary step errors
+ * so one forbidden resource neither aborts its env's remaining cleanup nor
+ * starves the rest of the sweep.
  */
-export function isAuthFailure(err: unknown): boolean {
-  return err instanceof CfError && (err.status === 401 || err.status === 403);
+export function isAuthenticationFailure(err: unknown): boolean {
+  return err instanceof CfError && err.status === 401;
 }
 
 const CF_API = "https://api.cloudflare.com/client/v4";
