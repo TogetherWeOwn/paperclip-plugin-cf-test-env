@@ -205,6 +205,19 @@ export class CfClient {
     );
   }
 
+  /**
+   * Names of all R2 buckets in the account. Used as an existence check before
+   * creating an env bucket, so provision never adopts (and later empties and
+   * deletes) a foreign bucket that happens to share the generated name.
+   */
+  async listBuckets(): Promise<string[]> {
+    const result = await this.request<{ buckets?: Array<{ name: string }> }>(
+      "GET",
+      `/accounts/${this.accountId}/r2/buckets`,
+    );
+    return (result.buckets ?? []).map((b) => b.name).filter((n) => typeof n === "string");
+  }
+
   async deleteBucket(name: string): Promise<void> {
     await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${name}`, undefined, {
       tolerateNotFound: true,

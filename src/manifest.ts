@@ -139,12 +139,12 @@ const manifest: PaperclipPluginManifestV1 = {
       workerAdminGroupId: {
         type: "string",
         default: "",
-        description: "Optional override for the Individual Workers Admin permission group id. Empty resolves it by name at provision time.",
+        description: "Required: Cloudflare permission group id for Individual Workers Admin. Empty disables provisioning (fail closed); never looked up by name at runtime.",
       },
       r2ItemWriteGroupId: {
         type: "string",
         default: "",
-        description: "Optional override for the Workers R2 Storage Bucket Item Write permission group id. Empty resolves it by name at provision time.",
+        description: "Required: Cloudflare permission group id for Workers R2 Storage Bucket Item Write. Empty disables provisioning (fail closed); never looked up by name at runtime.",
       },
     },
   },

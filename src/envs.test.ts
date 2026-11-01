@@ -103,7 +103,7 @@ describe("provision", () => {
     expect(fake.calls).toHaveLength(0);
   });
 
-  it("refuses to overwrite a pre-existing Worker", async () => {
+  it("refuses to overwrite a pre-existing Worker and leaves it intact", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const name = workerNameFor("pct-", issue.id, "abc123");
     await fake.fetch(`https://api.cloudflare.com/client/v4/accounts/acct-1/workers/scripts/${name}`, {
@@ -114,6 +114,23 @@ describe("provision", () => {
     await expect(
       provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
     ).rejects.toThrow(/already exists/);
+    // The rollback must not delete the Worker it refused to overwrite.
+    expect(fake.scripts.has(name)).toBe(true);
+    expect([...fake.tokens.keys()]).toHaveLength(0);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
+  it("refuses to adopt a pre-existing R2 bucket and leaves its data intact", async () => {
+    const { harness, fake, deps, run, issue } = await setup();
+    const name = workerNameFor("pct-", issue.id, "abc123");
+    await fake.fetch(`https://api.cloudflare.com/client/v4/accounts/acct-1/r2/buckets/${name}`, { method: "PUT" });
+    fake.buckets.get(name)!.objects.push("precious");
+    fake.calls.length = 0;
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/bucket.*already exists/);
+    expect(fake.buckets.get(name)?.objects).toEqual(["precious"]);
     expect([...fake.tokens.keys()]).toHaveLength(0);
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
     expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
@@ -283,6 +300,38 @@ describe("d1_execute", () => {
         deps,
       ),
     ).rejects.toThrow(/allow-list/);
+  });
+
+  it("revokes access when the card moves to a disallowed project", async () => {
+    const { harness, deps, run, issue } = await setup();
+    const provisioned = await provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps);
+    await harness.ctx.issues.update(issue.id, { projectId: "proj-other" } as never, COMPANY);
+    await expect(
+      d1Execute(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { envId: provisioned.envId, sql: "select 1" }, deps),
+    ).rejects.toThrow(/allow-list/);
+  });
+
+  it("tolerates records written before ownerAgentId existed", async () => {
+    const { harness, fake, deps, run, issue } = await setup();
+    const provisioned = await provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps);
+    const stored = (await liveEnvs(harness.ctx, COMPANY))[0]!;
+    const { ownerAgentId: _dropped, ...legacy } = stored;
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: COMPANY, stateKey: `cf-test-env:env:${stored.envId}` },
+      { ...legacy },
+    );
+    // The assignee on an allow-listed project still works; anyone else doesn't.
+    await d1Execute(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { envId: provisioned.envId, sql: "select 1" }, deps);
+    expect(fake.d1Queries).toHaveLength(1);
+    await expect(
+      d1Execute(
+        ctxOf(harness),
+        resolveConfig({ ...baseConfig }),
+        { ...run, agentId: OTHER },
+        { envId: provisioned.envId, sql: "select 1" },
+        deps,
+      ),
+    ).rejects.toThrow(/assigned/);
   });
 });
 

@@ -157,6 +157,9 @@ export class FakeCf {
         ...(next < keys.length ? { cursor: String(next) } : {}),
       });
     }
+    if (/^\/accounts\/[^/]+\/r2\/buckets$/.test(path) && method === "GET") {
+      return ok({ buckets: [...this.buckets.keys()].map((name) => ({ name })) });
+    }
     m = path.match(/^\/accounts\/[^/]+\/r2\/buckets\/([^/]+)$/);
     if (m && method === "PUT") {
       this.buckets.set(decodeURIComponent(m[1]!), { objects: [] });

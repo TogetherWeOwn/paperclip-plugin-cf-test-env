@@ -10,6 +10,11 @@
   crypto randomness and prefix validation for Worker names; 3 h TTL clamp;
   required issue project; account-path permission groups as required config;
   tool schema sync.
+- Devin round: rollback and sweep delete a Worker only when this provision
+  created it (pre-existing Workers survive); R2 bucket existence check;
+  `d1_execute`/agent `teardown` check the card's current project and tolerate
+  pre-`ownerAgentId` records; permission-group config documented as required;
+  lockfile version synced.
 
 ## 0.1.0
 

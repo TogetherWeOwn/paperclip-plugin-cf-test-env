@@ -50,6 +50,14 @@ describe("CfClient", () => {
     expect(fake.tokens.size).toBe(0);
   });
 
+  it("lists R2 bucket names", async () => {
+    const fake = new FakeCf();
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    expect(await cf.listBuckets()).toEqual([]);
+    await cf.createBucket("pct-a");
+    expect(await cf.listBuckets()).toEqual(["pct-a"]);
+  });
+
   it("CfError carries status and body", () => {
     const err = new CfError(403, "forbidden", "nope");
     expect(err.status).toBe(403);

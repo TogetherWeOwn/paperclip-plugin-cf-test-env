@@ -10,8 +10,12 @@ export interface EnvRecord {
   issueId: string;
   companyId: string;
   projectId: string;
-  /** Agent that provisioned the env; only it may use or tear it down. */
-  ownerAgentId: string;
+  /**
+   * Agent that provisioned the env; only it may use or tear it down.
+   * Optional: records written before 0.1.1 lack it and fall back to the
+   * current-assignee + allow-list checks in authorizeEnvCaller.
+   */
+  ownerAgentId?: string;
   workerName: string;
   workerId: string;
   d1Id: string;
@@ -36,7 +40,7 @@ export interface ProvisioningRecord {
   issueId: string;
   companyId: string;
   projectId: string;
-  ownerAgentId: string;
+  ownerAgentId?: string;
   workerName: string;
   workerId?: string;
   d1Id?: string;
@@ -183,6 +187,11 @@ export async function provision(
     if (existing) {
       throw new Error(`Worker ${workerName} already exists; refusing to overwrite it.`);
     }
+    // Same for the R2 bucket: adopting a foreign bucket would let rollback
+    // or teardown empty and delete somebody else's data.
+    if ((await cf.listBuckets()).includes(workerName)) {
+      throw new Error(`R2 bucket ${workerName} already exists; refusing to adopt it.`);
+    }
     // Create resources first: the per-Worker token needs the Worker id.
     const worker = await cf.createWorkerScript(workerName);
     progress.workerId = worker.id;
@@ -295,7 +304,14 @@ async function rollbackPartial(cf: CfClient, progress: ProvisioningRecord): Prom
   if (progress.tokenId) {
     await attempt("revoke token", () => cf.revokeAccountToken(progress.tokenId!));
   }
-  await attempt("delete worker", () => cf.deleteWorkerScript(progress.workerName));
+  // Only delete a Worker this provision created (create returned an id).
+  // In particular, never delete the pre-existing Worker that trips the
+  // overwrite guard above. Residual risk: a PUT that succeeded remotely with
+  // a lost response leaks one untracked Worker — accepted over deleting
+  // foreign Workers.
+  if (progress.workerId) {
+    await attempt("delete worker", () => cf.deleteWorkerScript(progress.workerName));
+  }
   if (progress.d1Id) {
     await attempt("delete d1", () => cf.deleteD1(progress.d1Id!));
   }
@@ -322,14 +338,19 @@ export async function authorizeEnvCaller(
   run: { agentId: string; companyId: string },
   env: AnyEnvRecord,
 ): Promise<void> {
-  if (run.agentId !== env.ownerAgentId) {
+  // Records written before 0.1.1 have no ownerAgentId; they fall back to the
+  // current-assignee + allow-list checks below.
+  if (env.ownerAgentId && run.agentId !== env.ownerAgentId) {
     throw new Error("Only the agent that provisioned this test env may use it.");
   }
   const issue = await ctx.issues.get(env.issueId, run.companyId);
   if (!issue || (issue as { assigneeAgentId?: string }).assigneeAgentId !== run.agentId) {
     throw new Error("Only the agent assigned to the issue may use its test env.");
   }
-  if (!config.allowedProjectIds.includes(env.projectId)) {
+  // The card's CURRENT project must be allow-listed: moving the card to a
+  // disallowed project revokes D1/teardown access instead of grandfathering it.
+  const currentProjectId = (issue as { projectId?: string }).projectId;
+  if (!currentProjectId || !config.allowedProjectIds.includes(currentProjectId)) {
     throw new Error("This project is not allow-listed for cf-test-env.");
   }
 }
@@ -430,7 +451,12 @@ export async function teardown(
   if (raw.tokenId) {
     await attempt("revoke token", () => cf.revokeAccountToken(raw.tokenId!));
   }
-  await attempt("delete worker", () => cf.deleteWorkerScript(raw.workerName));
+  // Live records always carry workerId; provisioning records only when this
+  // provision created the Worker — a swept pre-check record must never delete
+  // a foreign Worker that happens to share the name.
+  if (raw.status === "live" || raw.workerId) {
+    await attempt("delete worker", () => cf.deleteWorkerScript(raw.workerName));
+  }
   if (raw.d1Id) {
     const d1Id = raw.d1Id;
     await attempt("delete d1", () => cf.deleteD1(d1Id));

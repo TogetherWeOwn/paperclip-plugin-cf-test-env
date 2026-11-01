@@ -40,7 +40,7 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
 | `maxTtlSeconds` | `10800` | Token lifetime cap (3 h). |
 | `maxConcurrentEnvs` | `10` | Live-env cap per company. |
 | `egressCidr` | `""` | Host egress CIDR for the token `request.ip` filter. Empty means fail closed. |
-| `workerAdminGroupId` / `r2ItemWriteGroupId` | `""` | Permission-group id overrides. Empty resolves the "Individual Workers Admin" / "Workers R2 Storage Bucket Item Write" names at provision time and fails closed when missing. |
+| `workerAdminGroupId` / `r2ItemWriteGroupId` | `""` | Required permission-group ids ("Individual Workers Admin" / "Workers R2 Storage Bucket Item Write"). Empty means fail closed; never resolved by name at runtime. |
 
 ## Capabilities
 
