@@ -162,6 +162,37 @@ describe("CfClient", () => {
     expect(isAuthenticationFailure(new Error("boom"))).toBe(false);
   });
 
+  it("preserves a 401 status through malformed JSON envelopes", async () => {
+    // The stop-on-401 guarantee rides on status preservation: a 401 with a
+    // null, non-object or null-entry errors payload must still surface as
+    // CfError(401), not a TypeError that cleanup treats as an ordinary error.
+    for (const body of ["null", JSON.stringify({ errors: {} }), JSON.stringify({ errors: [null] })]) {
+      const cf = new CfClient(async () => new Response(body, { status: 401 }), "mint", "acct-1");
+      const err = await cf.createD1("pct-x").then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(CfError);
+      expect((err as CfError).status).toBe(401);
+      expect(isAuthenticationFailure(err)).toBe(true);
+    }
+  });
+
+  it("preserves a 401 status through a malformed multipart-upload envelope", async () => {
+    const cf = new CfClient(
+      async () => new Response(JSON.stringify({ errors: [null] }), { status: 401 }),
+      "mint",
+      "acct-1",
+    );
+    const err = await cf.createWorkerScript("pct-x").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(CfError);
+    expect((err as CfError).status).toBe(401);
+    expect(isAuthenticationFailure(err)).toBe(true);
+  });
+
   it("reads worker metadata and returns null for missing scripts", async () => {
     const fake = new FakeCf();
     const cf = new CfClient(fake.fetch, "mint", "acct-1");

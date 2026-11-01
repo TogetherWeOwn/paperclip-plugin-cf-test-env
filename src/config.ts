@@ -52,19 +52,40 @@ const isSecretRefBinding = (value: unknown): value is EnvSecretRefBinding => {
 const intOr = (value: unknown, fallback: number): number =>
   typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 
+/**
+ * Parse the egress CIDR list WITHOUT dropping blanks. `stringArray` (used for
+ * `allowedProjectIds`) drops empty/non-string members, which is wrong here: a
+ * blank is an operator typo, and silently dropping it would mint a token
+ * missing an egress family. Instead every blank or mistyped entry is
+ * preserved as `""`, and the gate below rejects it fail-closed. Only
+ * absent values (undefined/null, and the manifest-default legacy `""`) mean
+ * "unset".
+ */
+function parseEgressCidrs(raw: Record<string, unknown>): string[] {
+  const legacyRaw = raw.egressCidr;
+  const legacy =
+    typeof legacyRaw === "string"
+      ? legacyRaw.length === 0
+        ? []
+        : [legacyRaw.trim()]
+      : legacyRaw === undefined || legacyRaw === null
+        ? []
+        : [""];
+  const listed = Array.isArray(raw.egressCidrs)
+    ? raw.egressCidrs.map((c) => (typeof c === "string" ? c : ""))
+    : raw.egressCidrs === undefined || raw.egressCidrs === null
+      ? []
+      : [""];
+  return [...legacy, ...listed].map((c) => c.trim()).filter((c, i, a) => a.indexOf(c) === i);
+}
+
 /** Resolve operator config with the documented defaults. Unknown keys are ignored. */
 export function resolveConfig(raw: Record<string, unknown>): CfTestEnvConfig {
   const prefix =
     typeof raw.namePrefix === "string" && raw.namePrefix.length > 0 ? raw.namePrefix : DEFAULT_NAME_PREFIX;
   // `egressCidrs` (list) is canonical; a legacy single `egressCidr` string is
-  // merged in so configs written before the list existed keep working. Blank
-  // entries are preserved, not dropped: a blank is an operator typo, and
-  // silently dropping it would mint a token missing an egress family. The
-  // gate below rejects blank entries fail-closed.
-  const legacy = typeof raw.egressCidr === "string" ? raw.egressCidr.trim() : "";
-  const cidrs = [...(legacy ? [legacy] : []), ...stringArray(raw.egressCidrs)]
-    .map((c) => c.trim())
-    .filter((c, i, a) => a.indexOf(c) === i);
+  // merged in so configs written before the list existed keep working.
+  const cidrs = parseEgressCidrs(raw);
   return {
     tokenSecretRef: isSecretRefBinding(raw.tokenSecretRef) ? raw.tokenSecretRef : null,
     accountId: typeof raw.accountId === "string" ? raw.accountId.trim() : "",

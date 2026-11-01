@@ -136,7 +136,7 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         default: [],
         description:
-          "Host egress CIDRs for the token request.ip filter (IPv4 /32 AND IPv6 /64 — a host egressing over both needs both, or every call on the missing family 401s and repeated 401s lock the caller out). Empty disables provisioning (fail closed).",
+          "Host egress CIDRs for the token request.ip filter (IPv4 /32 AND IPv6 /64 — a host egressing over both needs both, or every call on the missing family 401s and repeated 401s lock the caller out). Empty disables provisioning (fail closed); clear a legacy egressCidr too, since it merges into this list.",
       },
       egressCidr: {
         type: "string",

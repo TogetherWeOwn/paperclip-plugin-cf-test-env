@@ -42,6 +42,29 @@ export function isAuthenticationFailure(err: unknown): boolean {
 
 const CF_API = "https://api.cloudflare.com/client/v4";
 
+/**
+ * Detail string from a v4 error envelope. Defensive about shape: a proxy or
+ * truncated body can yield `null`, a non-object, or null entries, and the
+ * status must survive that — the stop-on-401 guarantee rides on every
+ * failure surfacing as `CfError` with the real status, never a TypeError.
+ */
+function errorDetail(parsed: unknown): string {
+  if (typeof parsed !== "object" || parsed === null) return "";
+  const errors = (parsed as { errors?: unknown }).errors;
+  if (!Array.isArray(errors)) return "";
+  return errors
+    .map((e) => (typeof e === "object" && e !== null ? (e as { message?: unknown }).message : undefined))
+    .filter((m): m is string => typeof m === "string" && m.length > 0)
+    .join("; ");
+}
+
+/** Coerce a parsed JSON body to an envelope object; `null` and non-objects become `{}`. */
+function asEnvelope<T>(value: unknown): { success?: boolean; errors?: Array<{ message?: string }>; result?: T; result_info?: { cursor?: string } } {
+  return typeof value === "object" && value !== null
+    ? (value as { success?: boolean; errors?: Array<{ message?: string }>; result?: T; result_info?: { cursor?: string } })
+    : {};
+}
+
 export interface PermissionGroup {
   id: string;
   name: string;
@@ -96,7 +119,7 @@ export class CfClient {
       result_info?: { cursor?: string };
     } = {};
     try {
-      parsed = text ? (JSON.parse(text) as typeof parsed) : {};
+      parsed = text ? asEnvelope<T>(JSON.parse(text)) : {};
     } catch {
       // A 404 with an HTML body still means "absent" on tolerant deletes;
       // without this, teardown keeps the state record and retries forever.
@@ -121,7 +144,7 @@ export class CfClient {
     // retry. Callers that tolerate it return early above, so reaching here
     // with a 404 or a non-2xx is a real failure.
     if (status >= 200 && status < 300 && parsed.success !== false) return;
-    const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
+    const detail = errorDetail(parsed);
     throw new CfError(status, text.slice(0, 500), `Cloudflare ${method} ${path} failed: ${status}${detail ? ` ${detail}` : ""}`);
   }
 
@@ -153,12 +176,12 @@ export class CfClient {
     const text = await res.text();
     let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: { id: string } } = {};
     try {
-      parsed = text ? (JSON.parse(text) as typeof parsed) : {};
+      parsed = text ? asEnvelope<{ id: string }>(JSON.parse(text)) : {};
     } catch {
       throw new CfError(res.status, text.slice(0, 500), `Cloudflare PUT workers/scripts/${name}: non-JSON response ${res.status}`);
     }
     if (!res.ok || parsed.success === false) {
-      const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
+      const detail = errorDetail(parsed);
       throw new CfError(
         res.status,
         text.slice(0, 500),

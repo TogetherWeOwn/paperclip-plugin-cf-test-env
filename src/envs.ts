@@ -340,10 +340,27 @@ export async function provision(
     // dead and every rollback call would 401 too (same credential, same host,
     // same filter), so no rollback call is attempted — one deterministic
     // failure must not become several. The kept record lets the hourly sweep
-    // retry once the operator fixes the credential or filter.
-    const rollbackErrors = isAuthenticationFailure(err)
-      ? ["rollback skipped after an authentication failure; resources kept for the sweep"]
-      : await rollbackPartial(cf, progress);
+    // retry once the operator fixes the credential or filter — unless nothing
+    // was created (e.g. a preflight 401): then there is nothing to clean up,
+    // and keeping the record would only count against the concurrency cap
+    // until the sweep reaps it as stale.
+    const created = [
+      progress.tokenId,
+      progress.workerId,
+      progress.d1Id,
+      progress.kvId,
+      progress.r2Bucket,
+    ].some((id) => id !== undefined);
+    let rollbackErrors: string[];
+    if (isAuthenticationFailure(err) && !created) {
+      await ctx.state.delete(envKey(run.companyId, envId));
+      await removeFromIndex(ctx, run.companyId, envId);
+      rollbackErrors = [];
+    } else {
+      rollbackErrors = isAuthenticationFailure(err)
+        ? ["rollback skipped after an authentication failure; resources kept for the sweep"]
+        : await rollbackPartial(cf, progress);
+    }
     if (rollbackErrors.length === 0) {
       await ctx.state.delete(envKey(run.companyId, envId));
       await removeFromIndex(ctx, run.companyId, envId);

@@ -223,6 +223,41 @@ describe("provision", () => {
     expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(1);
   });
 
+  it("aborts remaining rollback steps when rollback itself hits a 401", async () => {
+    // Provision fails non-401 at the token mint, so rollback starts; the
+    // first rollback DELETE 401s (dead credential), and the remaining
+    // resource deletes must be skipped instead of stacking 401s.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.failOn = ["POST /accounts/acct-1/tokens"];
+    fake.failWithAuthOn = ["DELETE"];
+    const callsBefore = fake.calls.length;
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/rollback incomplete/);
+    const deletes = fake.calls.slice(callsBefore).filter((c) => c.method === "DELETE");
+    expect(deletes).toHaveLength(1);
+    // Nothing was undone past the first step: worker, D1, KV and R2 remain,
+    // and the provisioning record stays for the sweep.
+    expect(fake.scripts.size).toBe(1);
+    expect(fake.dbs.size).toBe(1);
+    expect(fake.namespaces.size).toBe(1);
+    expect(fake.buckets.size).toBe(1);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
+  it("drops the provisioning record when a 401 hits before anything was created", async () => {
+    // A preflight 401 (dead credential or IP filter) creates no resources, so
+    // there is nothing for the sweep to clean up: keeping the record would
+    // only count against the concurrency cap until it goes stale.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.failWithAuthOn = ["GET /accounts/acct-1/workers/scripts"];
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/401/);
+    expect(fake.calls.some((c) => c.method === "DELETE")).toBe(false);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
   it("revokes a minted token when a later step fails", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const upsert = harness.ctx.issues.documents.upsert.bind(harness.ctx.issues.documents);
@@ -547,6 +582,23 @@ describe("sweep and issue.updated", () => {
     const result = await sweep(ctxOf(harness), config, COMPANY, { ...deps, nowMs: NOW });
     expect(result.tornDown).toEqual([]);
     expect(result.errors.length).toBeGreaterThan(0);
+    expect(fake.calls.length - callsBefore).toBe(1);
+    expect(fake.scripts.has(first.workerName)).toBe(true);
+    expect(fake.scripts.has(second.workerName)).toBe(true);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(2);
+  });
+
+  it("stops issue.updated teardown on the first auth failure", async () => {
+    // Same dead credential on the same card: the first env's teardown 401s,
+    // and the second env must not add another 401.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const old = { ...deps, nowMs: NOW - 5 * 3600 * 1000 };
+    const first = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "333333" });
+    const second = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "444444" });
+    const callsBefore = fake.calls.length;
+    fake.failWithAuthOn = ["DELETE"];
+    await handleIssueUpdated(ctxOf(harness), config, COMPANY, issue.id, "done", { ...deps, nowMs: NOW });
     expect(fake.calls.length - callsBefore).toBe(1);
     expect(fake.scripts.has(first.workerName)).toBe(true);
     expect(fake.scripts.has(second.workerName)).toBe(true);
