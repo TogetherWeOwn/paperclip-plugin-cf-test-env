@@ -64,7 +64,7 @@ describe("token policies", () => {
 });
 
 describe("token request", () => {
-  it("sets expiry, not-before and the egress IP filter", () => {
+  it("sets expiry, not-before and the egress IP filter list", () => {
     const now = Date.parse("2026-11-01T19:30:00.000Z");
     const req = buildTokenRequest({
       name: "pct-x-token",
@@ -77,14 +77,14 @@ describe("token request", () => {
       }),
       nowMs: now,
       ttlSeconds: 3600,
-      egressCidr: "203.0.113.0/24",
+      egressCidrs: ["203.0.113.10/32", "2001:db8:8:cb76::/64"],
     });
     expect(req.expires_on).toBe("2026-11-01T20:30:00Z");
     expect(req.not_before).toBe("2026-11-01T19:30:00Z");
-    expect(req.condition).toEqual({ "request.ip": { in: ["203.0.113.0/24"] } });
+    expect(req.condition).toEqual({ "request.ip": { in: ["203.0.113.10/32", "2001:db8:8:cb76::/64"] } });
   });
 
-  it("fails closed without an egress CIDR or policies", () => {
+  it("fails closed without egress CIDRs, with empty entries, or without policies", () => {
     const policies = buildTokenPolicies({
       accountId: "a",
       workerId: "w",
@@ -93,10 +93,13 @@ describe("token request", () => {
       r2ItemWriteGroupId: "g2",
     });
     expect(() =>
-      buildTokenRequest({ name: "t", policies, nowMs: 0, ttlSeconds: 60, egressCidr: "" }),
+      buildTokenRequest({ name: "t", policies, nowMs: 0, ttlSeconds: 60, egressCidrs: [] }),
     ).toThrow(/egress/i);
     expect(() =>
-      buildTokenRequest({ name: "t", policies: [], nowMs: 0, ttlSeconds: 60, egressCidr: "10.0.0.0/8" }),
+      buildTokenRequest({ name: "t", policies, nowMs: 0, ttlSeconds: 60, egressCidrs: ["10.0.0.0/8", " "] }),
+    ).toThrow(/egress/i);
+    expect(() =>
+      buildTokenRequest({ name: "t", policies: [], nowMs: 0, ttlSeconds: 60, egressCidrs: ["10.0.0.0/8"] }),
     ).toThrow(/policies/);
   });
 });
@@ -115,16 +118,35 @@ describe("assertMintedTokenMatches", () => {
     workerAdminGroupId: "g1",
     r2ItemWriteGroupId: "g2",
   });
-  const expected = { policies, expiresOn: "2026-11-01T20:30:00Z", egressCidr: "203.0.113.0/24" };
+  const expected = {
+    policies,
+    expiresOn: "2026-11-01T20:30:00Z",
+    egressCidrs: ["203.0.113.10/32", "2001:db8:8:cb76::/64"],
+  };
   const minted = {
     id: "tok-1",
     policies,
     expires_on: "2026-11-01T20:30:00Z",
-    condition: { "request.ip": { in: ["203.0.113.0/24"] } },
+    condition: { "request.ip": { in: ["203.0.113.10/32", "2001:db8:8:cb76::/64"] } },
   };
 
   it("accepts a token that matches the request exactly", () => {
     expect(() => assertMintedTokenMatches(minted, expected)).not.toThrow();
+  });
+
+  it("accepts the CIDR list in any order but rejects a missing entry", () => {
+    const reordered = {
+      ...minted,
+      condition: { "request.ip": { in: ["2001:db8:8:cb76::/64", "203.0.113.10/32"] } },
+    };
+    expect(() => assertMintedTokenMatches(reordered, expected)).not.toThrow();
+    // A token filtered to only one family would 401 on the other, so a
+    // stored token missing a requested CIDR must fail verification.
+    const partial = {
+      ...minted,
+      condition: { "request.ip": { in: ["203.0.113.10/32"] } },
+    };
+    expect(() => assertMintedTokenMatches(partial, expected)).toThrow(/verification/);
   });
 
   it("rejects a dropped IP condition, a later expiry, and shape drift", () => {

@@ -16,7 +16,7 @@ account-wide "Workers Scripts Write" token could overwrite production, so:
 - D1 and KV have no per-resource roles (Cloudflare roadmap), so agents never
   get account-wide D1/KV write: D1 goes through the `d1_execute` tool, which
   the worker pins to the env's database id.
-- Every token expires within ≤3 h and is IP-filtered to the host egress CIDR.
+- Every token expires within ≤3 h and is IP-filtered to the host egress CIDRs (IPv4 and IPv6).
 
 Rejected alternatives: Workers for Platforms ($25/mo), Paperclip's native
 token broker (900 s cap, no issue context), a separate Cloudflare account.
@@ -39,7 +39,7 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
 | `namePrefix` | `"pct-"` | Prefix for all provisioned names; the sweeper only touches this plugin's own state index. |
 | `maxTtlSeconds` | `10800` | Token lifetime cap (3 h). |
 | `maxConcurrentEnvs` | `10` | Live-env cap per company. |
-| `egressCidr` | `""` | Host egress CIDR for the token `request.ip` filter. Empty means fail closed. |
+| `egressCidrs` | `[]` | Host egress CIDRs for the token `request.ip` filter — list every egress path (IPv4 /32 AND IPv6 /64). Empty means fail closed. A legacy single `egressCidr` string is merged in. |
 | `workerAdminGroupId` / `r2ItemWriteGroupId` | `""` | Required permission-group ids ("Individual Workers Admin" / "Workers R2 Storage Bucket Item Write"). Empty means fail closed; never resolved by name at runtime. |
 
 ## Capabilities
@@ -55,6 +55,11 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
   appear in the run transcript, bounded by its short TTL and IP filter.
 - Teardown revokes the token before deleting resources, so a leaked token
   dies even if deletion fails.
+- Auth failures (401/403) are never retried or looped over: rollback,
+  teardown and the sweep abort their remaining Cloudflare calls on the first
+  one, because Cloudflare locks the caller out after repeated authentication
+  failures. A token whose IP filter misses an egress family 401s on it, which
+  is why `egressCidrs` must cover both IPv4 and IPv6.
 - Tests use an in-memory Cloudflare fixture (`src/test-support/fake-cf.ts`);
   no real Cloudflare calls run in CI.
 - Canary (merge gate): the operator verifies a minted token can run

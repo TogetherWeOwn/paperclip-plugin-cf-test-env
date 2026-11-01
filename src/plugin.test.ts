@@ -12,7 +12,7 @@ const config = {
   tokenSecretRef: { type: "secret_ref", secretId: "s-1" },
   accountId: "acct-1",
   allowedProjectIds: [PROJ],
-  egressCidr: "203.0.113.0/24",
+  egressCidrs: ["203.0.113.10/32", "2001:db8:8:cb76::/64"],
   workerAdminGroupId: "grp-worker-admin",
   r2ItemWriteGroupId: "grp-r2-item-write",
 };
@@ -74,6 +74,7 @@ describe("plugin wiring", () => {
       "namePrefix",
       "maxTtlSeconds",
       "maxConcurrentEnvs",
+      "egressCidrs",
       "egressCidr",
     ]) {
       expect(manifest.instanceConfigSchema?.properties).toHaveProperty(key);

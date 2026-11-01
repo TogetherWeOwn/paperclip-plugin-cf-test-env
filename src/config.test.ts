@@ -10,7 +10,7 @@ const base = {
   tokenSecretRef: { type: "secret_ref", secretId: "s-1" },
   accountId: "acct-1",
   allowedProjectIds: ["proj-kofra"],
-  egressCidr: "203.0.113.0/24",
+  egressCidrs: ["203.0.113.10/32", "2001:db8:8:cb76::/64"],
   workerAdminGroupId: "grp-worker-admin",
   r2ItemWriteGroupId: "grp-r2-item-write",
 };
@@ -43,12 +43,28 @@ describe("resolveConfig", () => {
 });
 
 describe("checkProvisionAllowed", () => {
-  it("fails closed without credential, account, CIDR or allow-list", () => {
+  it("fails closed without credential, account, CIDRs or allow-list", () => {
     const config = resolveConfig(base);
     expect(checkProvisionAllowed({ ...config, tokenSecretRef: null }, { projectId: "proj-kofra", liveCount: 0 })?.code).toBe("not_configured");
     expect(checkProvisionAllowed({ ...config, accountId: "" }, { projectId: "proj-kofra", liveCount: 0 })?.code).toBe("not_configured");
-    expect(checkProvisionAllowed({ ...config, egressCidr: "" }, { projectId: "proj-kofra", liveCount: 0 })?.code).toBe("not_configured");
+    expect(checkProvisionAllowed({ ...config, egressCidrs: [] }, { projectId: "proj-kofra", liveCount: 0 })?.code).toBe("not_configured");
     expect(checkProvisionAllowed(resolveConfig({ ...base, allowedProjectIds: [] }), { projectId: "proj-kofra", liveCount: 0 })?.code).toBe("project_not_allowed");
+  });
+
+  it("merges a legacy single egressCidr into the list and dedupes", () => {
+    expect(resolveConfig(base).egressCidrs).toEqual([
+      "203.0.113.10/32",
+      "2001:db8:8:cb76::/64",
+    ]);
+    const { egressCidrs, ...noCidrs } = base;
+    void egressCidrs;
+    expect(resolveConfig({ ...noCidrs, egressCidr: "203.0.113.10/32" }).egressCidrs).toEqual([
+      "203.0.113.10/32",
+    ]);
+    expect(
+      resolveConfig({ ...base, egressCidr: "203.0.113.10/32" }).egressCidrs,
+    ).toEqual(["203.0.113.10/32", "2001:db8:8:cb76::/64"]);
+    expect(resolveConfig({ ...noCidrs, egressCidr: "" }).egressCidrs).toEqual([]);
   });
 
   it("rejects non-allow-listed projects and full caps", () => {

@@ -35,6 +35,12 @@ export class FakeCf {
   /** Entries of the form "METHOD path-substring": matching calls fail with 500. */
   failOn: string[] = [];
   /**
+   * Entries of the form "METHOD path-substring": matching calls fail with
+   * 401, simulating a dead minting credential or an IP filter that doesn't
+   * cover the caller. Teardown/rollback/sweep must abort, not retry.
+   */
+  failWithAuthOn: string[] = [];
+  /**
    * When true, reading a token back returns its stored body with the
    * `condition` stripped — simulating an API that silently drops an
    * unrecognised condition key. Provision must revoke and fail closed.
@@ -86,6 +92,9 @@ export class FakeCf {
       });
     if (this.failOn.some((rule) => `${method} ${path}`.includes(rule))) {
       return apiError(500, `injected failure for ${method} ${path}`);
+    }
+    if (this.failWithAuthOn.some((rule) => `${method} ${path}`.includes(rule))) {
+      return apiError(401, `injected auth failure for ${method} ${path}`);
     }
 
     // Workers scripts

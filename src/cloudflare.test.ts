@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CfClient, CfError } from "./cloudflare.js";
+import { CfClient, CfError, isAuthFailure } from "./cloudflare.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 describe("CfClient", () => {
@@ -150,6 +150,14 @@ describe("CfClient", () => {
     const err = new CfError(403, "forbidden", "nope");
     expect(err.status).toBe(403);
     expect(err.body).toBe("forbidden");
+  });
+
+  it("flags 401/403 as auth failures that callers must not retry", () => {
+    expect(isAuthFailure(new CfError(401, "unauthorized", "nope"))).toBe(true);
+    expect(isAuthFailure(new CfError(403, "forbidden", "nope"))).toBe(true);
+    expect(isAuthFailure(new CfError(404, "missing", "nope"))).toBe(false);
+    expect(isAuthFailure(new CfError(500, "boom", "nope"))).toBe(false);
+    expect(isAuthFailure(new Error("boom"))).toBe(false);
   });
 
   it("reads worker metadata and returns null for missing scripts", async () => {

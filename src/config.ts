@@ -8,7 +8,13 @@ export interface CfTestEnvConfig {
   namePrefix: string;
   maxTtlSeconds: number;
   maxConcurrentEnvs: number;
-  egressCidr: string;
+  /**
+   * Egress CIDRs for the token `request.ip` filter. Must cover every egress
+   * path of the host (e.g. its IPv4 /32 AND its IPv6 /64): a token filtered
+   * to only one family 401s on the other, and repeated 401s lock the caller
+   * out of the Cloudflare API.
+   */
+  egressCidrs: string[];
   workerAdminGroupId: string;
   r2ItemWriteGroupId: string;
 }
@@ -50,6 +56,12 @@ const intOr = (value: unknown, fallback: number): number =>
 export function resolveConfig(raw: Record<string, unknown>): CfTestEnvConfig {
   const prefix =
     typeof raw.namePrefix === "string" && raw.namePrefix.length > 0 ? raw.namePrefix : DEFAULT_NAME_PREFIX;
+  // `egressCidrs` (list) is canonical; a legacy single `egressCidr` string is
+  // merged in so configs written before the list existed keep working.
+  const legacy = typeof raw.egressCidr === "string" ? raw.egressCidr.trim() : "";
+  const cidrs = [legacy, ...stringArray(raw.egressCidrs)]
+    .map((c) => c.trim())
+    .filter((c, i, a) => c.length > 0 && a.indexOf(c) === i);
   return {
     tokenSecretRef: isSecretRefBinding(raw.tokenSecretRef) ? raw.tokenSecretRef : null,
     accountId: typeof raw.accountId === "string" ? raw.accountId.trim() : "",
@@ -59,7 +71,7 @@ export function resolveConfig(raw: Record<string, unknown>): CfTestEnvConfig {
     // max is clamped rather than honoured.
     maxTtlSeconds: Math.min(intOr(raw.maxTtlSeconds, DEFAULT_MAX_TTL_SECONDS), DEFAULT_MAX_TTL_SECONDS),
     maxConcurrentEnvs: intOr(raw.maxConcurrentEnvs, DEFAULT_MAX_CONCURRENT_ENVS),
-    egressCidr: typeof raw.egressCidr === "string" ? raw.egressCidr.trim() : "",
+    egressCidrs: cidrs,
     workerAdminGroupId:
       typeof raw.workerAdminGroupId === "string" ? raw.workerAdminGroupId.trim() : "",
     r2ItemWriteGroupId:
@@ -82,16 +94,17 @@ export interface ConfigError {
 
 /**
  * Fail-closed gate for provisioning. Returns null when provisioning may
- * proceed. Missing minting credential, account, egress CIDR, permission-group
- * ids or allow-list all block provisioning before any Cloudflare call is made.
- * `liveCount` covers every tracked env (live plus in-progress provisioning),
- * so repeated failed provisions can't bypass the concurrency cap either.
+ * proceed. Missing minting credential, account, egress CIDRs,
+ * permission-group ids or allow-list all block provisioning before any
+ * Cloudflare call is made. `liveCount` covers every tracked env (live plus
+ * in-progress provisioning), so repeated failed provisions can't bypass the
+ * concurrency cap either.
  */
 export function checkProvisionAllowed(
   config: CfTestEnvConfig,
   opts: { projectId: string; liveCount: number },
 ): ConfigError | null {
-  if (!config.tokenSecretRef || !config.accountId || !config.egressCidr) {
+  if (!config.tokenSecretRef || !config.accountId || config.egressCidrs.length === 0) {
     return { code: "not_configured", message: "cf-test-env is not configured; cannot provision." };
   }
   if (!config.workerAdminGroupId || !config.r2ItemWriteGroupId) {

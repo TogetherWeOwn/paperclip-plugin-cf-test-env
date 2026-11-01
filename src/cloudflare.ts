@@ -21,6 +21,18 @@ export class CfError extends Error {
   }
 }
 
+/**
+ * True for Cloudflare auth failures (bad/expired token, or a request.ip
+ * filter that doesn't cover the caller). Cloudflare locks the caller out
+ * after repeated authentication failures, so no caller may retry or loop
+ * over calls that fail this way: `emptyBucket`, `rollbackPartial`,
+ * `teardown` and `sweep` all abort their remaining Cloudflare calls on the
+ * first auth failure and surface it instead.
+ */
+export function isAuthFailure(err: unknown): boolean {
+  return err instanceof CfError && (err.status === 401 || err.status === 403);
+}
+
 const CF_API = "https://api.cloudflare.com/client/v4";
 
 export interface PermissionGroup {

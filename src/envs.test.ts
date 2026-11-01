@@ -15,7 +15,7 @@ const baseConfig = {
   tokenSecretRef: { type: "secret_ref", secretId: "s-1" },
   accountId: "acct-1",
   allowedProjectIds: [PROJ],
-  egressCidr: "203.0.113.0/24",
+  egressCidrs: ["203.0.113.10/32", "2001:db8:8:cb76::/64"],
   workerAdminGroupId: "grp-worker-admin",
   r2ItemWriteGroupId: "grp-r2-item-write",
 };
@@ -75,9 +75,11 @@ describe("provision", () => {
     for (const other of ["prod-worker-alpha", "prod-worker-beta", "shared-bucket"]) {
       expect(serialized).not.toContain(other);
     }
-    // IP filter (dotted key) and expiry (no milliseconds) are set.
+    // IP filter (dotted key, both families) and expiry (no milliseconds) are set.
     const tokenBody = tokenCalls[0]!.body as { condition: unknown; expires_on: string };
-    expect(tokenBody.condition).toEqual({ "request.ip": { in: ["203.0.113.0/24"] } });
+    expect(tokenBody.condition).toEqual({
+      "request.ip": { in: ["203.0.113.10/32", "2001:db8:8:cb76::/64"] },
+    });
     expect(tokenBody.expires_on).toBe("2026-11-01T22:30:00Z");
     // Card record holds names only — never the token.
     const doc = await harness.ctx.issues.documents.get(issue.id, "cf-test-env", COMPANY);
@@ -452,6 +454,22 @@ describe("teardown", () => {
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
   });
 
+  it("stops after the first auth failure instead of stacking 401s", async () => {
+    // A dead minting credential (or an IP filter that doesn't cover the
+    // caller) 401s every call; Cloudflare locks the caller out after repeated
+    // authentication failures, so teardown must abort, not loop.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const provisioned = await provision(ctxOf(harness), config, run, { issueId: issue.id }, deps);
+    const callsBefore = fake.calls.length;
+    fake.failWithAuthOn = ["DELETE"];
+    const { errors, authFailed } = await teardown(ctxOf(harness), config, COMPANY, provisioned.envId, deps);
+    expect(authFailed).toBe(true);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(fake.calls.length - callsBefore).toBe(1);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
   it("empties multi-page buckets with per-object deletes", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const config = resolveConfig({ ...baseConfig });
@@ -478,6 +496,25 @@ describe("sweep and issue.updated", () => {
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
     expect((await liveEnvs(harness.ctx, COMPANY))[0]!.envId).toBe(live.envId);
     expect(fake.scripts.has(live.workerName)).toBe(true);
+  });
+
+  it("stops the sweep on the first auth failure", async () => {
+    // With a dead credential every env would 401 the same way; the sweep
+    // must stop after the first instead of stacking one 401 per env.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const old = { ...deps, nowMs: NOW - 5 * 3600 * 1000 };
+    const first = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "111111" });
+    const second = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "222222" });
+    const callsBefore = fake.calls.length;
+    fake.failWithAuthOn = ["DELETE"];
+    const result = await sweep(ctxOf(harness), config, COMPANY, { ...deps, nowMs: NOW });
+    expect(result.tornDown).toEqual([]);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(fake.calls.length - callsBefore).toBe(1);
+    expect(fake.scripts.has(first.workerName)).toBe(true);
+    expect(fake.scripts.has(second.workerName)).toBe(true);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(2);
   });
 
   it("tears down envs whose card is done", async () => {
