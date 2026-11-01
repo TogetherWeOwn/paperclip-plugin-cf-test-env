@@ -68,13 +68,45 @@ export class CfClient {
 
   // -- Workers ----------------------------------------------------------
 
-  /** Upload a stub script. Returns the Worker id used for per-Worker scoping. */
+  /**
+   * Upload a stub script. The script-upload endpoint takes multipart/form-data
+   * (a `metadata` part plus the module), not JSON — a JSON body is rejected.
+   * Returns the Worker id the per-Worker role is keyed on. (The classic script
+   * API returns the script name as `id` plus a separate `tag`; provision uses
+   * the returned `id` for scoping and the canary confirms it against the real
+   * API.)
+   */
   async createWorkerScript(name: string): Promise<{ id: string }> {
     const stub = `export default { async fetch() { return new Response("pct stub", { status: 200 }); } };`;
-    return this.request<{ id: string }>("PUT", `/accounts/${this.accountId}/workers/scripts/${name}`, {
-      script: stub,
-      bindings: [],
+    const form = new FormData();
+    form.set(
+      "metadata",
+      new Blob([JSON.stringify({ main_module: "worker.js", bindings: [] })], {
+        type: "application/json",
+      }),
+    );
+    form.set("worker.js", new Blob([stub], { type: "application/javascript+module" }), "worker.js");
+    const res = await this.fetchImpl(`${CF_API}/accounts/${this.accountId}/workers/scripts/${name}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${this.apiToken}` },
+      body: form,
     });
+    const text = await res.text();
+    let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: { id: string } } = {};
+    try {
+      parsed = text ? (JSON.parse(text) as typeof parsed) : {};
+    } catch {
+      throw new CfError(res.status, text.slice(0, 500), `Cloudflare PUT workers/scripts/${name}: non-JSON response ${res.status}`);
+    }
+    if (!res.ok || parsed.success === false) {
+      const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
+      throw new CfError(
+        res.status,
+        text.slice(0, 500),
+        `Cloudflare PUT workers/scripts/${name} failed: ${res.status}${detail ? ` ${detail}` : ""}`,
+      );
+    }
+    return parsed.result as { id: string };
   }
 
   async deleteWorkerScript(name: string): Promise<void> {
@@ -84,15 +116,17 @@ export class CfClient {
   }
 
   /**
-   * Fetch script metadata. Returns null when the script doesn't exist (404),
-   * so provision can fail closed instead of silently overwriting a
-   * pre-existing Worker with a PUT.
+   * Check whether a script exists. Uses the settings sub-resource (JSON) rather
+   * than fetching the script itself: on a script that exists the content
+   * endpoint returns the script body, which is not JSON and would throw.
+   * Returns null when the script doesn't exist (404), so provision can fail
+   * closed instead of silently overwriting a pre-existing Worker with a PUT.
    */
   async getWorkerScript(name: string): Promise<{ id: string } | null> {
     try {
       return await this.request<{ id: string }>(
         "GET",
-        `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(name)}`,
+        `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(name)}/settings`,
       );
     } catch (err) {
       if (err instanceof CfError && err.status === 404) return null;
@@ -124,6 +158,11 @@ export class CfClient {
       `/accounts/${this.accountId}/tokens`,
       body,
     );
+  }
+
+  /** Read back a minted token so provision can verify it matches the request. */
+  async getAccountToken(tokenId: string): Promise<unknown> {
+    return this.request<unknown>("GET", `/accounts/${this.accountId}/tokens/${tokenId}`);
   }
 
   async revokeAccountToken(tokenId: string): Promise<void> {
@@ -169,8 +208,13 @@ export class CfClient {
 
   // -- R2 -----------------------------------------------------------------
 
+  /**
+   * Create a bucket. Creation is `POST /r2/buckets` with `{name}` — a POST for
+   * an existing bucket conflicts, which backs up the pre-create existence
+   * check in provision.
+   */
   async createBucket(name: string): Promise<void> {
-    await this.request<unknown>("PUT", `/accounts/${this.accountId}/r2/buckets/${name}`);
+    await this.request<unknown>("POST", `/accounts/${this.accountId}/r2/buckets`, { name });
   }
 
   /**
@@ -208,14 +252,29 @@ export class CfClient {
   /**
    * Names of all R2 buckets in the account. Used as an existence check before
    * creating an env bucket, so provision never adopts (and later empties and
-   * deletes) a foreign bucket that happens to share the generated name.
+   * deletes) a foreign bucket that happens to share the generated name. The
+   * account already holds more buckets than one page, so every page is
+   * followed (`per_page=1000` + cursor) — a single page could miss a name and
+   * let provision adopt a foreign bucket.
    */
   async listBuckets(): Promise<string[]> {
-    const result = await this.request<{ buckets?: Array<{ name: string }> }>(
-      "GET",
-      `/accounts/${this.accountId}/r2/buckets`,
-    );
-    return (result.buckets ?? []).map((b) => b.name).filter((n) => typeof n === "string");
+    const names: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const params = new URLSearchParams({ per_page: "1000" });
+      if (cursor) params.set("cursor", cursor);
+      const result = await this.request<{
+        buckets?: Array<{ name: string }>;
+        truncated?: boolean;
+        cursor?: string;
+      }>("GET", `/accounts/${this.accountId}/r2/buckets?${params.toString()}`);
+      for (const b of result.buckets ?? []) {
+        if (typeof b.name === "string") names.push(b.name);
+      }
+      if (!result.truncated || !result.cursor) break;
+      cursor = result.cursor;
+    }
+    return names;
   }
 
   async deleteBucket(name: string): Promise<void> {

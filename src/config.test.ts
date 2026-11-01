@@ -37,7 +37,7 @@ describe("resolveConfig", () => {
     expect(isValidNamePrefix("t-")).toBe(false);
     expect(isValidNamePrefix("PCT-")).toBe(false);
     expect(isValidNamePrefix("pct")).toBe(false);
-    expect(isValidNamePrefix("two-web-next-")).toBe(false);
+    expect(isValidNamePrefix("prod-app-")).toBe(false);
     expect(isValidNamePrefix("")).toBe(false);
   });
 });
@@ -74,7 +74,7 @@ describe("checkProvisionAllowed", () => {
       })?.code,
     ).toBe("not_configured");
     expect(
-      checkProvisionAllowed(resolveConfig({ ...full, namePrefix: "two-web-next-" }), {
+      checkProvisionAllowed(resolveConfig({ ...full, namePrefix: "prod-app-" }), {
         projectId: "proj-kofra",
         liveCount: 0,
       })?.code,

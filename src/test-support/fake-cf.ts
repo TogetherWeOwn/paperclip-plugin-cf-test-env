@@ -12,6 +12,9 @@
 export interface RecordedCall {
   method: string;
   path: string;
+  /** Raw query string (without the leading `?`), so tests can assert on
+   * pagination parameters. */
+  query: string;
   body: unknown;
 }
 
@@ -31,6 +34,12 @@ export class FakeCf {
   ];
   /** Entries of the form "METHOD path-substring": matching calls fail with 500. */
   failOn: string[] = [];
+  /**
+   * When true, reading a token back returns its stored body with the
+   * `condition` stripped — simulating an API that silently drops an
+   * unrecognised condition key. Provision must revoke and fail closed.
+   */
+  dropTokenConditionOnRead = false;
   private seq = 0;
 
   fetch = async (url: string, init?: RequestInit): Promise<Response> => {
@@ -43,7 +52,7 @@ export class FakeCf {
     } catch {
       body = String(init?.body);
     }
-    this.calls.push({ method, path, body });
+    this.calls.push({ method, path, query: parsed.searchParams.toString(), body });
     const ok = (result: unknown) =>
       new Response(JSON.stringify({ success: true, errors: [], result }), {
         status: 200,
@@ -61,13 +70,18 @@ export class FakeCf {
     // Workers scripts
     let m = path.match(/^\/accounts\/[^/]+\/workers\/scripts\/([^/]+)$/);
     if (m && method === "PUT") {
+      // Accepts the real multipart upload (body is FormData, not JSON); the
+      // fake only tracks existence by name from the path.
       const name = decodeURIComponent(m[1]!);
       const id = `wid-${name}`;
       this.scripts.set(name, { id });
       return ok({ id, name });
     }
-    if (m && method === "GET") {
-      const name = decodeURIComponent(m[1]!);
+    const settings = path.match(/^\/accounts\/[^/]+\/workers\/scripts\/([^/]+)\/settings$/);
+    if (settings && method === "GET") {
+      // Existence check via the JSON settings sub-resource: fetching the
+      // script itself returns the script body, which is not JSON.
+      const name = decodeURIComponent(settings[1]!);
       const script = this.scripts.get(name);
       if (!script) return apiError(404, "script not found");
       return ok({ id: script.id, name });
@@ -92,6 +106,16 @@ export class FakeCf {
       return ok({ id, value });
     }
     m = path.match(/^\/accounts\/[^/]+\/tokens\/([^/]+)$/);
+    if (m && method === "GET") {
+      const id = decodeURIComponent(m[1]!);
+      const stored = this.tokens.get(id);
+      if (!stored) return apiError(404, "token not found");
+      const body = stored.body as Record<string, unknown>;
+      const result = this.dropTokenConditionOnRead
+        ? (({ condition: _dropped, ...rest }) => ({ id, ...rest }))(body)
+        : { id, ...body };
+      return ok(result);
+    }
     if (m && method === "DELETE") {
       const id = decodeURIComponent(m[1]!);
       this.revokedTokens.push(id);
@@ -158,13 +182,27 @@ export class FakeCf {
       });
     }
     if (/^\/accounts\/[^/]+\/r2\/buckets$/.test(path) && method === "GET") {
-      return ok({ buckets: [...this.buckets.keys()].map((name) => ({ name })) });
+      // Cursor-paginated like the real listing: the client must follow pages.
+      const names = [...this.buckets.keys()];
+      const perPage = Math.max(1, Number(parsed.searchParams.get("per_page") ?? "1000"));
+      const start = Number(parsed.searchParams.get("cursor") ?? "0");
+      const page = names.slice(start, start + perPage);
+      const next = start + perPage;
+      return ok({
+        buckets: page.map((name) => ({ name })),
+        truncated: next < names.length,
+        ...(next < names.length ? { cursor: String(next) } : {}),
+      });
     }
-    m = path.match(/^\/accounts\/[^/]+\/r2\/buckets\/([^/]+)$/);
-    if (m && method === "PUT") {
-      this.buckets.set(decodeURIComponent(m[1]!), { objects: [] });
+    if (/^\/accounts\/[^/]+\/r2\/buckets$/.test(path) && method === "POST") {
+      // Real shape: POST with `{name}`; an existing bucket conflicts.
+      const name = (body as { name?: string })?.name;
+      if (typeof name !== "string" || !name) return apiError(400, "bucket name is required");
+      if (this.buckets.has(name)) return apiError(409, "bucket already exists");
+      this.buckets.set(name, { objects: [] });
       return ok({});
     }
+    m = path.match(/^\/accounts\/[^/]+\/r2\/buckets\/([^/]+)$/);
     if (m && method === "DELETE") {
       const name = decodeURIComponent(m[1]!);
       if (!this.buckets.has(name)) return apiError(404, "bucket not found");

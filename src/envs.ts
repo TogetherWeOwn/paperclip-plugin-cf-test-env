@@ -3,7 +3,13 @@ import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { CfClient, type FetchImpl } from "./cloudflare.js";
 import { checkProvisionAllowed, type CfTestEnvConfig } from "./config.js";
 import { ENV_DOC_KEY } from "./manifest.js";
-import { buildTokenPolicies, buildTokenRequest, clampTtl, workerNameFor } from "./scoping.js";
+import {
+  assertMintedTokenMatches,
+  buildTokenPolicies,
+  buildTokenRequest,
+  clampTtl,
+  workerNameFor,
+} from "./scoping.js";
 
 export interface EnvRecord {
   envId: string;
@@ -80,6 +86,51 @@ async function readIndex(ctx: PluginContext, companyId: string): Promise<string[
 
 async function writeIndex(ctx: PluginContext, companyId: string, ids: string[]): Promise<void> {
   await ctx.state.set(indexKey(companyId), ids);
+}
+
+/**
+ * Promise-chain mutex per company for the env index. Two provisions (or a
+ * provision racing the hourly sweep or a teardown) that each do
+ * read-modify-write can otherwise drop an envId from the index; the sweep and
+ * `issue.updated` only walk the index, so that env's Worker, D1, KV and R2
+ * would leak with no record, and the concurrency cap would undercount. Every
+ * index change goes through `addToIndex`/`removeFromIndex` — an add or remove
+ * inside the lock, never a write-back of a stale copy.
+ */
+const indexLocks = new Map<string, Promise<void>>();
+
+async function withIndexLock<T>(companyId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = indexLocks.get(companyId) ?? Promise.resolve();
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  indexLocks.set(companyId, prev.then(() => turn));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (indexLocks.get(companyId) === turn) indexLocks.delete(companyId);
+  }
+}
+
+async function addToIndex(ctx: PluginContext, companyId: string, envId: string): Promise<void> {
+  await withIndexLock(companyId, async () => {
+    const ids = await readIndex(ctx, companyId);
+    if (!ids.includes(envId)) {
+      await writeIndex(ctx, companyId, [...ids, envId]);
+    }
+  });
+}
+
+async function removeFromIndex(ctx: PluginContext, companyId: string, envId: string): Promise<void> {
+  await withIndexLock(companyId, async () => {
+    const ids = await readIndex(ctx, companyId);
+    if (ids.includes(envId)) {
+      await writeIndex(ctx, companyId, ids.filter((id) => id !== envId));
+    }
+  });
 }
 
 export async function readEnv(ctx: PluginContext, companyId: string, envId: string): Promise<EnvRecord | null> {
@@ -178,7 +229,7 @@ export async function provision(
     await ctx.state.set(envKey(run.companyId, envId), { ...progress });
   };
   await saveProgress();
-  await writeIndex(ctx, run.companyId, [...(await readIndex(ctx, run.companyId)), envId]);
+  await addToIndex(ctx, run.companyId, envId);
 
   try {
     // Never overwrite a pre-existing Worker: the minted token would otherwise
@@ -226,6 +277,15 @@ export async function provision(
     progress.tokenId = token.id;
     progress.expiresAt = tokenReq.expires_on;
     await saveProgress();
+    // Fail closed on shape drift: verify the stored token carries the exact
+    // egress CIDR, an expiry no later than requested, exactly 2 policies, and
+    // exactly the resource keys built above. On mismatch the catch below
+    // revokes the token (progress.tokenId is set) and rolls everything back.
+    assertMintedTokenMatches(await cf.getAccountToken(token.id), {
+      policies,
+      expiresOn: tokenReq.expires_on,
+      egressCidr: config.egressCidr,
+    });
 
     const record: EnvRecord = {
       envId,
@@ -274,11 +334,7 @@ export async function provision(
     const rollbackErrors = await rollbackPartial(cf, progress);
     if (rollbackErrors.length === 0) {
       await ctx.state.delete(envKey(run.companyId, envId));
-      await writeIndex(
-        ctx,
-        run.companyId,
-        (await readIndex(ctx, run.companyId)).filter((id) => id !== envId),
-      );
+      await removeFromIndex(ctx, run.companyId, envId);
     } else {
       await saveProgress();
     }
@@ -473,11 +529,7 @@ export async function teardown(
 
   if (errors.length === 0) {
     await ctx.state.delete(envKey(companyId, envId));
-    await writeIndex(
-      ctx,
-      companyId,
-      (await readIndex(ctx, companyId)).filter((id) => id !== envId),
-    );
+    await removeFromIndex(ctx, companyId, envId);
     if (raw.status === "live") {
       try {
         await ctx.issues.documents.upsert({

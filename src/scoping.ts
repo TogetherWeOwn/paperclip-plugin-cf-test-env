@@ -41,7 +41,10 @@ export interface TokenRequest {
   policies: TokenPolicy[];
   expires_on: string;
   not_before: string;
-  condition: { request_ip: { in: string[] } };
+  /** Dotted key is what Cloudflare documents (`"request.ip"`); `request_ip`
+   * with an underscore is silently ignored, which would mint an unfiltered
+   * token. */
+  condition: { "request.ip": { in: string[] } };
 }
 
 /** Worker names are lowercase alphanumerics and dashes (Cloudflare script-name rule). */
@@ -106,6 +109,15 @@ export function buildTokenPolicies(opts: {
   ];
 }
 
+/**
+ * Cloudflare documents `expires_on`/`not_before` as `"2018-07-01T05:20:00Z"`
+ * with no milliseconds. `toISOString()` produces `.000Z`; strip the fraction
+ * so the API can never read the timestamp in a lenient or odd way.
+ */
+export function toCloudflareTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 export function buildTokenRequest(opts: {
   name: string;
   policies: TokenPolicy[];
@@ -125,10 +137,55 @@ export function buildTokenRequest(opts: {
   return {
     name: opts.name,
     policies: opts.policies,
-    not_before: new Date(opts.nowMs).toISOString(),
-    expires_on: new Date(opts.nowMs + opts.ttlSeconds * 1000).toISOString(),
-    condition: { request_ip: { in: [opts.egressCidr] } },
+    not_before: toCloudflareTimestamp(opts.nowMs),
+    expires_on: toCloudflareTimestamp(opts.nowMs + opts.ttlSeconds * 1000),
+    condition: { "request.ip": { in: [opts.egressCidr] } },
   };
+}
+
+/**
+ * Verify the token the API actually minted, right after creation. A wrong
+ * request shape can pass every unit test and still produce a weaker token
+ * (e.g. an ignored condition key), so provision fails closed unless the stored
+ * token shows: the exact egress CIDR under `"request.ip"`, an expiry no later
+ * than requested, exactly 2 policies, and exactly the resource keys built
+ * above. Throws on any mismatch; the caller revokes and rolls back.
+ */
+export function assertMintedTokenMatches(
+  actual: unknown,
+  expected: { policies: TokenPolicy[]; expiresOn: string; egressCidr: string },
+): void {
+  const fail = (detail: string): never => {
+    throw new Error(`minted token failed verification (${detail}); refusing to hand it out`);
+  };
+  const rec = (actual ?? {}) as Record<string, unknown>;
+  const condition = (rec.condition ?? {}) as Record<string, unknown>;
+  const reqIp = (condition["request.ip"] ?? {}) as Record<string, unknown>;
+  const within = Array.isArray(reqIp.in) ? reqIp.in : [];
+  if (within.length !== 1 || within[0] !== expected.egressCidr) {
+    fail("IP condition is not exactly the requested egress CIDR");
+  }
+  const expiresOn = rec.expires_on;
+  if (
+    typeof expiresOn !== "string" ||
+    Number.isNaN(Date.parse(expiresOn)) ||
+    Date.parse(expiresOn) > Date.parse(expected.expiresOn)
+  ) {
+    fail("expiry is missing, unparsable, or later than requested");
+  }
+  const policies = rec.policies;
+  if (!Array.isArray(policies) || policies.length !== 2) {
+    fail(`expected exactly 2 policies, saw ${Array.isArray(policies) ? policies.length : typeof policies}`);
+  }
+  const keyOf = (p: unknown): string =>
+    Object.keys(((p as Record<string, unknown>).resources ?? {}) as Record<string, unknown>)
+      .sort()
+      .join(",");
+  const actualKeys = (policies as unknown[]).map(keyOf).sort();
+  const expectedKeys = expected.policies.map(keyOf).sort();
+  if (JSON.stringify(actualKeys) !== JSON.stringify(expectedKeys)) {
+    fail("policy resource keys differ from those requested");
+  }
 }
 
 /** Clamp the requested TTL to the configured max; reject non-positive values. */

@@ -50,12 +50,53 @@ describe("CfClient", () => {
     expect(fake.tokens.size).toBe(0);
   });
 
+  it("uploads Worker scripts as multipart form data, not JSON", async () => {
+    let seen: RequestInit | undefined;
+    const cf = new CfClient(async (_url: string, init?: RequestInit) => {
+      seen = init;
+      return new Response(JSON.stringify({ success: true, errors: [], result: { id: "wid-x", name: "x" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }, "mint", "acct-1");
+    await cf.createWorkerScript("pct-multi");
+    expect(seen?.method).toBe("PUT");
+    expect(seen?.body).toBeInstanceOf(FormData);
+    // fetch sets the multipart boundary itself; a JSON content-type would
+    // override it and the upload would be rejected.
+    expect(JSON.stringify(seen?.headers ?? {})).not.toContain("application/json");
+    const form = seen?.body as FormData;
+    expect(form.has("metadata")).toBe(true);
+  });
+
   it("lists R2 bucket names", async () => {
     const fake = new FakeCf();
     const cf = new CfClient(fake.fetch, "mint", "acct-1");
     expect(await cf.listBuckets()).toEqual([]);
     await cf.createBucket("pct-a");
     expect(await cf.listBuckets()).toEqual(["pct-a"]);
+  });
+
+  it("creates R2 buckets with POST and conflicts on duplicates", async () => {
+    const fake = new FakeCf();
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    await cf.createBucket("pct-dup");
+    const create = fake.calls.find((c) => c.method === "POST" && c.path.endsWith("/r2/buckets"));
+    expect(create?.body).toEqual({ name: "pct-dup" });
+    await expect(cf.createBucket("pct-dup")).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("follows every R2 list page so the collision pre-check sees all buckets", async () => {
+    const fake = new FakeCf();
+    for (let i = 0; i < 2500; i++) {
+      fake.buckets.set(`pct-seed-${i}`, { objects: [] });
+    }
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    const names = await cf.listBuckets();
+    expect(names).toHaveLength(2500);
+    const pages = fake.calls.filter((c) => c.method === "GET" && c.path.endsWith("/r2/buckets"));
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages[0]!.query).toContain("per_page=1000");
   });
 
   it("CfError carries status and body", () => {
@@ -70,6 +111,10 @@ describe("CfClient", () => {
     expect(await cf.getWorkerScript("pct-missing")).toBeNull();
     await cf.createWorkerScript("pct-test-bbb");
     expect(await cf.getWorkerScript("pct-test-bbb")).toEqual({ id: "wid-pct-test-bbb", name: "pct-test-bbb" });
+    // Existence goes through the JSON settings sub-resource, never the
+    // script-content endpoint (which returns the body, not JSON).
+    expect(fake.calls.some((c) => c.method === "GET" && c.path.endsWith("/settings"))).toBe(true);
+    expect(fake.calls.some((c) => c.method === "GET" && /\/scripts\/[^/]+$/.test(c.path))).toBe(false);
   });
 
   it("treats 404 on DELETE as success (idempotent teardown)", async () => {

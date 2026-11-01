@@ -75,10 +75,10 @@ describe("provision", () => {
     for (const other of ["prod-worker-alpha", "prod-worker-beta", "shared-bucket"]) {
       expect(serialized).not.toContain(other);
     }
-    // IP filter and expiry are set.
+    // IP filter (dotted key) and expiry (no milliseconds) are set.
     const tokenBody = tokenCalls[0]!.body as { condition: unknown; expires_on: string };
-    expect(tokenBody.condition).toEqual({ request_ip: { in: ["203.0.113.0/24"] } });
-    expect(tokenBody.expires_on).toBe(new Date(NOW + 10800 * 1000).toISOString());
+    expect(tokenBody.condition).toEqual({ "request.ip": { in: ["203.0.113.0/24"] } });
+    expect(tokenBody.expires_on).toBe("2026-11-01T22:30:00Z");
     // Card record holds names only — never the token.
     const doc = await harness.ctx.issues.documents.get(issue.id, "cf-test-env", COMPANY);
     expect(doc?.body).toContain(result.workerName);
@@ -124,7 +124,10 @@ describe("provision", () => {
   it("refuses to adopt a pre-existing R2 bucket and leaves its data intact", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const name = workerNameFor("pct-", issue.id, "abc123");
-    await fake.fetch(`https://api.cloudflare.com/client/v4/accounts/acct-1/r2/buckets/${name}`, { method: "PUT" });
+    await fake.fetch(`https://api.cloudflare.com/client/v4/accounts/acct-1/r2/buckets`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
     fake.buckets.get(name)!.objects.push("precious");
     fake.calls.length = 0;
     await expect(
@@ -170,7 +173,7 @@ describe("provision", () => {
       ),
     ).rejects.toThrow(/permission group/);
     await expect(
-      provision(ctxOf(harness), resolveConfig({ ...baseConfig, namePrefix: "two-web-next-" }), run, { issueId: issue.id }, deps),
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig, namePrefix: "prod-app-" }), run, { issueId: issue.id }, deps),
     ).rejects.toThrow(/invalid/);
     await expect(
       provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id, ttlSeconds: 99999 }, deps),
@@ -183,7 +186,7 @@ describe("provision", () => {
       "PUT /accounts/acct-1/workers/scripts",
       "POST /accounts/acct-1/d1/database",
       "POST /accounts/acct-1/storage/kv/namespaces",
-      "PUT /accounts/acct-1/r2/buckets",
+      "POST /accounts/acct-1/r2/buckets",
       "POST /accounts/acct-1/tokens",
     ]) {
       const { harness, fake, deps, run, issue } = await setup();
@@ -222,6 +225,43 @@ describe("provision", () => {
     expect(fake.namespaces.size).toBe(0);
     expect(fake.buckets.size).toBe(0);
     expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
+  it("revokes the minted token and fails closed when verification fails", async () => {
+    const { harness, fake, deps, run, issue } = await setup();
+    // The API silently drops the condition: the read-back token has no IP
+    // filter, so provision must revoke it and throw without returning a value.
+    fake.dropTokenConditionOnRead = true;
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/verification/);
+    expect(fake.calls.some((c) => c.method === "GET" && /\/tokens\//.test(c.path))).toBe(true);
+    expect(fake.revokedTokens).toHaveLength(1);
+    expect([...fake.tokens.values()]).toHaveLength(0);
+    expect(fake.scripts.size).toBe(0);
+    expect(fake.dbs.size).toBe(0);
+    expect(fake.namespaces.size).toBe(0);
+    expect(fake.buckets.size).toBe(0);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
+  it("keeps parallel provisions from dropping index entries", async () => {
+    const { harness, deps, run, issue } = await setup();
+    const other = await harness.ctx.issues.create({
+      companyId: COMPANY,
+      title: "other",
+      projectId: PROJ,
+      assigneeAgentId: AGENT,
+    });
+    const config = resolveConfig({ ...baseConfig });
+    const [a, b] = await Promise.all([
+      provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...deps, randHex: "aaaaaa" }),
+      provision(ctxOf(harness), config, run, { issueId: other.id }, { ...deps, randHex: "bbbbbb" }),
+    ]);
+    expect(a.envId).not.toBe(b.envId);
+    const tracked = await allEnvs(harness.ctx, COMPANY);
+    expect(tracked.map((e) => e.envId).sort()).toEqual([a.envId, b.envId].sort());
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(2);
   });
 
   it("keeps the provisioning record when rollback itself fails, for the sweep", async () => {
