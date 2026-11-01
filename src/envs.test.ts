@@ -15,7 +15,7 @@ const baseConfig = {
   tokenSecretRef: { type: "secret_ref", secretId: "s-1" },
   accountId: "acct-1",
   allowedProjectIds: [PROJ],
-  egressCidr: "203.0.113.0/24",
+  egressCidrs: ["203.0.113.10/32", "2001:db8:8:cb76::/64"],
   workerAdminGroupId: "grp-worker-admin",
   r2ItemWriteGroupId: "grp-r2-item-write",
 };
@@ -75,9 +75,11 @@ describe("provision", () => {
     for (const other of ["prod-worker-alpha", "prod-worker-beta", "shared-bucket"]) {
       expect(serialized).not.toContain(other);
     }
-    // IP filter (dotted key) and expiry (no milliseconds) are set.
+    // IP filter (dotted key, both families) and expiry (no milliseconds) are set.
     const tokenBody = tokenCalls[0]!.body as { condition: unknown; expires_on: string };
-    expect(tokenBody.condition).toEqual({ "request.ip": { in: ["203.0.113.0/24"] } });
+    expect(tokenBody.condition).toEqual({
+      "request.ip": { in: ["203.0.113.10/32", "2001:db8:8:cb76::/64"] },
+    });
     expect(tokenBody.expires_on).toBe("2026-11-01T22:30:00Z");
     // Card record holds names only — never the token.
     const doc = await harness.ctx.issues.documents.get(issue.id, "cf-test-env", COMPANY);
@@ -202,6 +204,58 @@ describe("provision", () => {
       expect(fake.buckets.size).toBe(0);
       expect([...fake.tokens.values()]).toHaveLength(0);
     }
+  });
+
+  it("skips rollback calls when provisioning itself dies with a 401", async () => {
+    // Same credential, same host, same filter: every rollback call would 401
+    // too, so none is attempted — one deterministic failure must not become
+    // several. The record is kept for the hourly sweep.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.failWithAuthOn = ["POST /accounts/acct-1/d1/database"];
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/rollback skipped/);
+    // The Worker created before the 401 is recorded but untouched: no DELETE
+    // was attempted, and the provisioning record stays for the sweep.
+    expect(fake.calls.some((c) => c.method === "DELETE")).toBe(false);
+    expect(fake.scripts.size).toBe(1);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
+  it("aborts remaining rollback steps when rollback itself hits a 401", async () => {
+    // Provision fails non-401 at the token mint, so rollback starts; the
+    // first rollback DELETE 401s (dead credential), and the remaining
+    // resource deletes must be skipped instead of stacking 401s.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.failOn = ["POST /accounts/acct-1/tokens"];
+    fake.failWithAuthOn = ["DELETE"];
+    const callsBefore = fake.calls.length;
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/rollback incomplete/);
+    const deletes = fake.calls.slice(callsBefore).filter((c) => c.method === "DELETE");
+    expect(deletes).toHaveLength(1);
+    // Nothing was undone past the first step: worker, D1, KV and R2 remain,
+    // and the provisioning record stays for the sweep.
+    expect(fake.scripts.size).toBe(1);
+    expect(fake.dbs.size).toBe(1);
+    expect(fake.namespaces.size).toBe(1);
+    expect(fake.buckets.size).toBe(1);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
+  it("drops the provisioning record when a 401 hits before anything was created", async () => {
+    // A preflight 401 (dead credential or IP filter) creates no resources, so
+    // there is nothing for the sweep to clean up: keeping the record would
+    // only count against the concurrency cap until it goes stale.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.failWithAuthOn = ["GET /accounts/acct-1/workers/scripts"];
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/401/);
+    expect(fake.calls.some((c) => c.method === "DELETE")).toBe(false);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
   });
 
   it("revokes a minted token when a later step fails", async () => {
@@ -452,6 +506,41 @@ describe("teardown", () => {
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
   });
 
+  it("stops after the first auth failure instead of stacking 401s", async () => {
+    // A dead minting credential (or an IP filter that doesn't cover the
+    // caller) 401s every call; Cloudflare locks the caller out after repeated
+    // authentication failures, so teardown must abort, not loop.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const provisioned = await provision(ctxOf(harness), config, run, { issueId: issue.id }, deps);
+    const callsBefore = fake.calls.length;
+    fake.failWithAuthOn = ["DELETE"];
+    const { errors, authFailed } = await teardown(ctxOf(harness), config, COMPANY, provisioned.envId, deps);
+    expect(authFailed).toBe(true);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(fake.calls.length - callsBefore).toBe(1);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
+  it("records a 403 but continues the remaining cleanup instead of aborting", async () => {
+    // A 403 is resource-specific, not a dead credential: the remaining steps
+    // still run, and the sweep must not treat it as fatal.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const provisioned = await provision(ctxOf(harness), config, run, { issueId: issue.id }, deps);
+    fake.failWithForbiddenOn = ["DELETE /accounts/acct-1/d1/database"];
+    const { errors, authFailed } = await teardown(ctxOf(harness), config, COMPANY, provisioned.envId, deps);
+    expect(authFailed).toBe(false);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("delete d1");
+    // Cleanup continued past the forbidden D1: Worker, KV and R2 are gone.
+    expect(fake.scripts.has(provisioned.workerName)).toBe(false);
+    expect(fake.namespaces.size).toBe(0);
+    expect(fake.buckets.has(provisioned.workerName)).toBe(false);
+    // The error keeps the record for retry.
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+  });
+
   it("empties multi-page buckets with per-object deletes", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const config = resolveConfig({ ...baseConfig });
@@ -478,6 +567,58 @@ describe("sweep and issue.updated", () => {
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
     expect((await liveEnvs(harness.ctx, COMPANY))[0]!.envId).toBe(live.envId);
     expect(fake.scripts.has(live.workerName)).toBe(true);
+  });
+
+  it("stops the sweep on the first auth failure", async () => {
+    // With a dead credential every env would 401 the same way; the sweep
+    // must stop after the first instead of stacking one 401 per env.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const old = { ...deps, nowMs: NOW - 5 * 3600 * 1000 };
+    const first = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "111111" });
+    const second = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "222222" });
+    const callsBefore = fake.calls.length;
+    fake.failWithAuthOn = ["DELETE"];
+    const result = await sweep(ctxOf(harness), config, COMPANY, { ...deps, nowMs: NOW });
+    expect(result.tornDown).toEqual([]);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(fake.calls.length - callsBefore).toBe(1);
+    expect(fake.scripts.has(first.workerName)).toBe(true);
+    expect(fake.scripts.has(second.workerName)).toBe(true);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(2);
+  });
+
+  it("stops issue.updated teardown on the first auth failure", async () => {
+    // Same dead credential on the same card: the first env's teardown 401s,
+    // and the second env must not add another 401.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const old = { ...deps, nowMs: NOW - 5 * 3600 * 1000 };
+    const first = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "333333" });
+    const second = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "444444" });
+    const callsBefore = fake.calls.length;
+    fake.failWithAuthOn = ["DELETE"];
+    await handleIssueUpdated(ctxOf(harness), config, COMPANY, issue.id, "done", { ...deps, nowMs: NOW });
+    expect(fake.calls.length - callsBefore).toBe(1);
+    expect(fake.scripts.has(first.workerName)).toBe(true);
+    expect(fake.scripts.has(second.workerName)).toBe(true);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(2);
+  });
+
+  it("tears down later envs even when an earlier env keeps 403ing", async () => {
+    // A 403 is resource-specific: one stuck env must not starve the rest of
+    // the sweep the way a 401 (dead credential) does.
+    const { harness, fake, deps, run, issue } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const old = { ...deps, nowMs: NOW - 5 * 3600 * 1000 };
+    const first = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "111111" });
+    const second = await provision(ctxOf(harness), config, run, { issueId: issue.id }, { ...old, randHex: "222222" });
+    fake.failWithForbiddenOn = [`DELETE /accounts/acct-1/r2/buckets/${first.workerName}`];
+    const result = await sweep(ctxOf(harness), config, COMPANY, { ...deps, nowMs: NOW });
+    expect(result.tornDown).toEqual([second.envId]);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0]).toContain(first.envId);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(1);
   });
 
   it("tears down envs whose card is done", async () => {

@@ -43,7 +43,9 @@ export interface TokenRequest {
   not_before: string;
   /** Dotted key is what Cloudflare documents (`"request.ip"`); `request_ip`
    * with an underscore is silently ignored, which would mint an unfiltered
-   * token. */
+   * token. The list must cover every egress path of the host (e.g. its IPv4
+   * /32 AND its IPv6 /64): a token filtered to only one family 401s on the
+   * other, and repeated 401s lock the caller out. */
   condition: { "request.ip": { in: string[] } };
 }
 
@@ -123,13 +125,18 @@ export function buildTokenRequest(opts: {
   policies: TokenPolicy[];
   nowMs: number;
   ttlSeconds: number;
-  egressCidr: string;
+  egressCidrs: string[];
 }): TokenRequest {
   if (!Number.isInteger(opts.ttlSeconds) || opts.ttlSeconds <= 0) {
     throw new Error("ttlSeconds must be a positive integer");
   }
-  if (!opts.egressCidr) {
-    throw new Error("egressCidr is required: refusing to mint an unfiltered token");
+  if (!Array.isArray(opts.egressCidrs) || opts.egressCidrs.length === 0) {
+    throw new Error("egressCidrs is required: refusing to mint an unfiltered token");
+  }
+  for (const cidr of opts.egressCidrs) {
+    if (typeof cidr !== "string" || !cidr.trim()) {
+      throw new Error("egressCidrs must not contain empty entries: refusing to mint a misfiltered token");
+    }
   }
   if (opts.policies.length === 0) {
     throw new Error("refusing to mint a token with no policies");
@@ -139,7 +146,7 @@ export function buildTokenRequest(opts: {
     policies: opts.policies,
     not_before: toCloudflareTimestamp(opts.nowMs),
     expires_on: toCloudflareTimestamp(opts.nowMs + opts.ttlSeconds * 1000),
-    condition: { "request.ip": { in: [opts.egressCidr] } },
+    condition: { "request.ip": { in: [...opts.egressCidrs] } },
   };
 }
 
@@ -147,17 +154,17 @@ export function buildTokenRequest(opts: {
  * Verify the token the API actually minted, right after creation. A wrong
  * request shape can pass every unit test and still produce a weaker token
  * (e.g. an ignored condition key), so provision fails closed unless the stored
- * token shows: the exact egress CIDR under `"request.ip"`, an expiry no later
- * than requested, and exactly the two policies built above — compared whole,
- * not just by resource key. A key-only check would pass a token whose stored
- * policy kept the key but widened the value (e.g. a nested
- * `com.cloudflare.api.account.<id>: "*"` covering the whole account) or
- * swapped in a broader permission group. Throws on any mismatch; the caller
- * revokes and rolls back.
+ * token shows: the exact egress CIDR list under `"request.ip"` (same members,
+ * any order), an expiry no later than requested, and exactly the two policies
+ * built above — compared whole, not just by resource key. A key-only check
+ * would pass a token whose stored policy kept the key but widened the value
+ * (e.g. a nested `com.cloudflare.api.account.<id>: "*"` covering the whole
+ * account) or swapped in a broader permission group. Throws on any mismatch;
+ * the caller revokes and rolls back.
  */
 export function assertMintedTokenMatches(
   actual: unknown,
-  expected: { policies: TokenPolicy[]; expiresOn: string; egressCidr: string },
+  expected: { policies: TokenPolicy[]; expiresOn: string; egressCidrs: string[] },
 ): void {
   const fail = (detail: string): never => {
     throw new Error(`minted token failed verification (${detail}); refusing to hand it out`);
@@ -166,8 +173,11 @@ export function assertMintedTokenMatches(
   const condition = (rec.condition ?? {}) as Record<string, unknown>;
   const reqIp = (condition["request.ip"] ?? {}) as Record<string, unknown>;
   const within = Array.isArray(reqIp.in) ? reqIp.in : [];
-  if (within.length !== 1 || within[0] !== expected.egressCidr) {
-    fail("IP condition is not exactly the requested egress CIDR");
+  const sameMembers =
+    within.length === expected.egressCidrs.length &&
+    [...within].sort().every((v, i) => v === [...expected.egressCidrs].sort()[i]);
+  if (!sameMembers) {
+    fail("IP condition is not exactly the requested egress CIDR list");
   }
   const expiresOn = rec.expires_on;
   if (

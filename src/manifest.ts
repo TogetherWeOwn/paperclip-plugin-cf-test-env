@@ -131,10 +131,18 @@ const manifest: PaperclipPluginManifestV1 = {
         default: 10,
         description: "Maximum live envs per company. Provisioning beyond it is rejected.",
       },
+      egressCidrs: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description:
+          "Host egress CIDRs for the token request.ip filter (IPv4 /32 AND IPv6 /64 — a host egressing over both needs both, or every call on the missing family 401s and repeated 401s lock the caller out). Empty disables provisioning (fail closed); clear a legacy egressCidr too, since it merges into this list.",
+      },
       egressCidr: {
         type: "string",
         default: "",
-        description: "Host egress CIDR for the token request.ip filter. Empty disables provisioning (fail closed).",
+        description:
+          "Deprecated single-CIDR alias, merged into egressCidrs. Prefer egressCidrs.",
       },
       workerAdminGroupId: {
         type: "string",

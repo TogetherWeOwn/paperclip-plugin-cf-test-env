@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CfClient, CfError } from "./cloudflare.js";
+import { CfClient, CfError, isAuthenticationFailure } from "./cloudflare.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 describe("CfClient", () => {
@@ -150,6 +150,47 @@ describe("CfClient", () => {
     const err = new CfError(403, "forbidden", "nope");
     expect(err.status).toBe(403);
     expect(err.body).toBe("forbidden");
+  });
+
+  it("flags only 401 as an authentication failure that stops all further calls", () => {
+    expect(isAuthenticationFailure(new CfError(401, "unauthorized", "nope"))).toBe(true);
+    // A 403 is a resource-specific permission problem, not a dead credential:
+    // callers record it and continue instead of aborting the sweep.
+    expect(isAuthenticationFailure(new CfError(403, "forbidden", "nope"))).toBe(false);
+    expect(isAuthenticationFailure(new CfError(404, "missing", "nope"))).toBe(false);
+    expect(isAuthenticationFailure(new CfError(500, "boom", "nope"))).toBe(false);
+    expect(isAuthenticationFailure(new Error("boom"))).toBe(false);
+  });
+
+  it("preserves a 401 status through malformed JSON envelopes", async () => {
+    // The stop-on-401 guarantee rides on status preservation: a 401 with a
+    // null, non-object or null-entry errors payload must still surface as
+    // CfError(401), not a TypeError that cleanup treats as an ordinary error.
+    for (const body of ["null", JSON.stringify({ errors: {} }), JSON.stringify({ errors: [null] })]) {
+      const cf = new CfClient(async () => new Response(body, { status: 401 }), "mint", "acct-1");
+      const err = await cf.createD1("pct-x").then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(CfError);
+      expect((err as CfError).status).toBe(401);
+      expect(isAuthenticationFailure(err)).toBe(true);
+    }
+  });
+
+  it("preserves a 401 status through a malformed multipart-upload envelope", async () => {
+    const cf = new CfClient(
+      async () => new Response(JSON.stringify({ errors: [null] }), { status: 401 }),
+      "mint",
+      "acct-1",
+    );
+    const err = await cf.createWorkerScript("pct-x").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(CfError);
+    expect((err as CfError).status).toBe(401);
+    expect(isAuthenticationFailure(err)).toBe(true);
   });
 
   it("reads worker metadata and returns null for missing scripts", async () => {

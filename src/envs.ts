@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { CfClient, type FetchImpl } from "./cloudflare.js";
+import { CfClient, isAuthenticationFailure, type FetchImpl } from "./cloudflare.js";
 import { checkProvisionAllowed, type CfTestEnvConfig } from "./config.js";
 import { ENV_DOC_KEY } from "./manifest.js";
 import {
@@ -275,7 +275,7 @@ export async function provision(
       policies,
       nowMs,
       ttlSeconds: ttl,
-      egressCidr: config.egressCidr,
+      egressCidrs: config.egressCidrs,
     });
     const token = await cf.createAccountToken(tokenReq);
     progress.tokenId = token.id;
@@ -288,7 +288,7 @@ export async function provision(
     assertMintedTokenMatches(await cf.getAccountToken(token.id), {
       policies,
       expiresOn: tokenReq.expires_on,
-      egressCidr: config.egressCidr,
+      egressCidrs: config.egressCidrs,
     });
 
     const record: EnvRecord = {
@@ -335,7 +335,32 @@ export async function provision(
     // Roll back in teardown order — revoke the token first — then rethrow.
     // When rollback is clean there is nothing for the sweep to do, so the
     // provisioning record is dropped; otherwise it is kept for the sweep.
-    const rollbackErrors = await rollbackPartial(cf, progress);
+    //
+    // If provisioning itself died with a 401, the credential or IP filter is
+    // dead and every rollback call would 401 too (same credential, same host,
+    // same filter), so no rollback call is attempted — one deterministic
+    // failure must not become several. The kept record lets the hourly sweep
+    // retry once the operator fixes the credential or filter — unless nothing
+    // was created (e.g. a preflight 401): then there is nothing to clean up,
+    // and keeping the record would only count against the concurrency cap
+    // until the sweep reaps it as stale.
+    const created = [
+      progress.tokenId,
+      progress.workerId,
+      progress.d1Id,
+      progress.kvId,
+      progress.r2Bucket,
+    ].some((id) => id !== undefined);
+    let rollbackErrors: string[];
+    if (isAuthenticationFailure(err) && !created) {
+      await ctx.state.delete(envKey(run.companyId, envId));
+      await removeFromIndex(ctx, run.companyId, envId);
+      rollbackErrors = [];
+    } else {
+      rollbackErrors = isAuthenticationFailure(err)
+        ? ["rollback skipped after an authentication failure; resources kept for the sweep"]
+        : await rollbackPartial(cf, progress);
+    }
     if (rollbackErrors.length === 0) {
       await ctx.state.delete(envKey(run.companyId, envId));
       await removeFromIndex(ctx, run.companyId, envId);
@@ -350,15 +375,22 @@ export async function provision(
 
 /**
  * Best-effort rollback of a partial provision, in teardown order. Returns the
- * step errors (empty when everything was undone).
+ * step errors (empty when everything was undone). Aborts the remaining steps
+ * on the first 401: every further call would fail the same way, and
+ * Cloudflare locks the caller out after repeated authentication failures.
+ * A 403 is recorded as an ordinary step error and the remaining steps still
+ * run — it is resource-specific, not a dead credential.
  */
 async function rollbackPartial(cf: CfClient, progress: ProvisioningRecord): Promise<string[]> {
   const errors: string[] = [];
+  let authFailed = false;
   const attempt = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
+    if (authFailed) return;
     try {
       await fn();
     } catch (err) {
       errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+      if (isAuthenticationFailure(err)) authFailed = true;
     }
   };
   if (progress.tokenId) {
@@ -448,6 +480,11 @@ export async function d1Execute(
  * converge; a bucket that never empties fails loudly and keeps state.
  */
 export async function emptyBucket(cf: CfClient, bucket: string): Promise<void> {
+  // No retries here: any Cloudflare error (in particular a 401
+  // authentication failure) propagates immediately instead of looping. The
+  // round loop below only repeats after a fully successful snapshot-and-delete
+  // pass that still finds objects (concurrent adds) — it never retries a
+  // failed call.
   for (let round = 0; round < 10; round++) {
     const keys: string[] = [];
     let cursor: string | undefined;
@@ -485,15 +522,20 @@ export async function teardown(
   envId: string,
   deps: { fetchImpl: FetchImpl; resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string> },
   run?: { agentId: string },
-): Promise<{ errors: string[] }> {
+): Promise<{ errors: string[]; authFailed: boolean }> {
   const errors: string[] = [];
   const raw = await readAnyEnv(ctx, companyId, envId);
-  if (!raw) return { errors };
+  if (!raw) return { errors, authFailed: false };
+  // Set on the first 401: every further Cloudflare call would fail the same
+  // way, and Cloudflare locks the caller out after repeated authentication
+  // failures — so the steps below stop instead of looping. A 403 is recorded
+  // as an ordinary step error and the remaining steps still run.
+  let authFailed = false;
   if (run) {
     await authorizeEnvCaller(ctx, config, { agentId: run.agentId, companyId }, raw);
   }
   if (!config.tokenSecretRef || !config.accountId) {
-    return { errors: ["cf-test-env is not configured; cannot tear down. State kept for retry."] };
+    return { errors: ["cf-test-env is not configured; cannot tear down. State kept for retry."], authFailed };
   }
   const mintToken = deps.resolveMintToken
     ? await deps.resolveMintToken(config.tokenSecretRef, companyId)
@@ -501,10 +543,12 @@ export async function teardown(
   const cf = new CfClient(deps.fetchImpl, mintToken, config.accountId);
 
   const attempt = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
+    if (authFailed) return;
     try {
       await fn();
     } catch (err) {
       errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+      if (isAuthenticationFailure(err)) authFailed = true;
     }
   };
 
@@ -549,7 +593,7 @@ export async function teardown(
       }
     }
   }
-  return { errors };
+  return { errors, authFailed };
 }
 
 export async function liveEnvs(ctx: PluginContext, companyId: string): Promise<EnvRecord[]> {
@@ -605,12 +649,15 @@ export async function sweep(
       }
     }
     if (!stale) continue;
-    const { errors } = await teardown(ctx, config, companyId, env.envId, deps);
+    const { errors, authFailed } = await teardown(ctx, config, companyId, env.envId, deps);
     if (errors.length === 0) {
       result.tornDown.push(env.envId);
     } else {
       result.errors.push(...errors.map((e) => `${env.envId}: ${e}`));
     }
+    // The minting credential (or its IP filter) is broken: every further env
+    // would fail the same way, so stop the sweep instead of stacking 401s.
+    if (authFailed) break;
   }
   return result;
 }
@@ -642,6 +689,8 @@ export async function handleIssueUpdated(
     if (env.status === "provisioning" && nowMs - Date.parse(env.createdAt) <= PROVISIONING_STALE_MS) {
       continue;
     }
-    await teardown(ctx, config, companyId, env.envId, deps);
+    // One broken credential must not stack a 401 per env on the same card.
+    const { authFailed } = await teardown(ctx, config, companyId, env.envId, deps);
+    if (authFailed) break;
   }
 }
