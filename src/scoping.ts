@@ -148,8 +148,12 @@ export function buildTokenRequest(opts: {
  * request shape can pass every unit test and still produce a weaker token
  * (e.g. an ignored condition key), so provision fails closed unless the stored
  * token shows: the exact egress CIDR under `"request.ip"`, an expiry no later
- * than requested, exactly 2 policies, and exactly the resource keys built
- * above. Throws on any mismatch; the caller revokes and rolls back.
+ * than requested, and exactly the two policies built above — compared whole,
+ * not just by resource key. A key-only check would pass a token whose stored
+ * policy kept the key but widened the value (e.g. a nested
+ * `com.cloudflare.api.account.<id>: "*"` covering the whole account) or
+ * swapped in a broader permission group. Throws on any mismatch; the caller
+ * revokes and rolls back.
  */
 export function assertMintedTokenMatches(
   actual: unknown,
@@ -177,15 +181,43 @@ export function assertMintedTokenMatches(
   if (!Array.isArray(policies) || policies.length !== 2) {
     fail(`expected exactly 2 policies, saw ${Array.isArray(policies) ? policies.length : typeof policies}`);
   }
-  const keyOf = (p: unknown): string =>
-    Object.keys(((p as Record<string, unknown>).resources ?? {}) as Record<string, unknown>)
-      .sort()
-      .join(",");
-  const actualKeys = (policies as unknown[]).map(keyOf).sort();
-  const expectedKeys = expected.policies.map(keyOf).sort();
-  if (JSON.stringify(actualKeys) !== JSON.stringify(expectedKeys)) {
-    fail("policy resource keys differ from those requested");
+  // Whole-policy comparison: effect, the FULL resources object (keys and
+  // nested values), and the sorted permission-group ids. Order-independent
+  // across the policy list, exact within each policy.
+  const normalised = (policies as unknown[]).map(normalisePolicy).map((p) => JSON.stringify(p)).sort();
+  const wanted = expected.policies.map(normalisePolicy).map((p) => JSON.stringify(p)).sort();
+  if (JSON.stringify(normalised) !== JSON.stringify(wanted)) {
+    fail("stored token policies differ from those requested");
   }
+}
+
+/** Canonical form of one token policy for exact comparison. */
+function normalisePolicy(p: unknown): { effect: string; resources: unknown; groupIds: string[] } {
+  const rec = (p ?? {}) as Record<string, unknown>;
+  const groups = rec.permission_groups;
+  const groupIds = Array.isArray(groups)
+    ? groups
+        .map((g) => (g as { id?: unknown } | null)?.id)
+        .filter((id): id is string => typeof id === "string")
+        .sort()
+    : [];
+  return {
+    effect: typeof rec.effect === "string" ? rec.effect : "",
+    resources: canonicalValue(rec.resources ?? {}),
+    groupIds,
+  };
+}
+
+/** Recursively sort object keys so structurally-equal values stringify equally. */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    return Object.fromEntries(entries.map(([k, v]) => [k, canonicalValue(v)]));
+  }
+  return value;
 }
 
 /** Clamp the requested TTL to the configured max; reject non-positive values. */

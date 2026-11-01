@@ -105,13 +105,17 @@ async function withIndexLock<T>(companyId: string, fn: () => Promise<T>): Promis
   const turn = new Promise<void>((resolve) => {
     release = resolve;
   });
-  indexLocks.set(companyId, prev.then(() => turn));
+  // Compare against the stored tail, not `turn`: the map holds
+  // `prev.then(() => turn)` (a different promise object), so comparing with
+  // `turn` never matched and idle company entries leaked forever.
+  const tail = prev.then(() => turn);
+  indexLocks.set(companyId, tail);
   await prev;
   try {
     return await fn();
   } finally {
     release();
-    if (indexLocks.get(companyId) === turn) indexLocks.delete(companyId);
+    if (indexLocks.get(companyId) === tail) indexLocks.delete(companyId);
   }
 }
 
@@ -618,13 +622,26 @@ export async function handleIssueUpdated(
   companyId: string,
   issueId: string,
   status: string,
-  deps: { fetchImpl: FetchImpl; resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string> },
+  deps: {
+    fetchImpl: FetchImpl;
+    nowMs?: number;
+    resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string>;
+  },
 ): Promise<void> {
   if (status !== "done" && status !== "cancelled") return;
+  const nowMs = deps.nowMs ?? Date.now();
   // Only touch envs that reference this exact issue id — never name-prefix scans.
   for (const env of await allEnvs(ctx, companyId)) {
-    if (env.issueId === issueId) {
-      await teardown(ctx, config, companyId, env.envId, deps);
+    if (env.issueId !== issueId) continue;
+    // Never pull the index out from under a still-running provision: a
+    // `provisioning` record younger than the sweep's stale window is left for
+    // the sweep (which only tears down stale provisioning records). The
+    // just-closed card still loses its env — once the run finishes, the env is
+    // either rolled back or `live` on a closed card, and the next sweep tears
+    // it down. Nothing leaks; the token still expires within 3 h regardless.
+    if (env.status === "provisioning" && nowMs - Date.parse(env.createdAt) <= PROVISIONING_STALE_MS) {
+      continue;
     }
+    await teardown(ctx, config, companyId, env.envId, deps);
   }
 }

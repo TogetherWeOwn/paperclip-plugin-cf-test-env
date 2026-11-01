@@ -147,6 +147,41 @@ describe("assertMintedTokenMatches", () => {
     const swapped = [{ ...policies[1] }, { ...policies[0] }] as typeof policies;
     expect(() => assertMintedTokenMatches({ ...minted, policies: swapped }, expected)).not.toThrow();
   });
+
+  it("rejects a widened resource value even when the resource key matches", () => {
+    // The whole-account nesting the workerResource comment warns about: same
+    // top-level shape family, but the value covers everything.
+    const broadened = policies.map((p) => ({ ...p }));
+    broadened[0] = {
+      ...broadened[0]!,
+      resources: { "com.cloudflare.api.account.a": "*" },
+    };
+    expect(() => assertMintedTokenMatches({ ...minted, policies: broadened }, expected)).toThrow(
+      /policies differ/,
+    );
+    // Same key, different leaf value.
+    const changedValue = policies.map((p) => ({ ...p }));
+    changedValue[1] = {
+      ...changedValue[1]!,
+      resources: { [`${R2_BUCKET_RESOURCE}.a_default_b`]: "partial" },
+    };
+    expect(() => assertMintedTokenMatches({ ...minted, policies: changedValue }, expected)).toThrow(
+      /policies differ/,
+    );
+  });
+
+  it("rejects a swapped permission group and a changed effect", () => {
+    const regrouped = policies.map((p) => ({ ...p }));
+    regrouped[0] = { ...regrouped[0]!, permission_groups: [{ id: "grp-something-broader" }] };
+    expect(() => assertMintedTokenMatches({ ...minted, policies: regrouped }, expected)).toThrow(
+      /policies differ/,
+    );
+    const deffect = policies.map((p) => ({ ...p }));
+    deffect[1] = { ...deffect[1]!, effect: "deny" } as unknown as typeof policies[number];
+    expect(() => assertMintedTokenMatches({ ...minted, policies: deffect }, expected)).toThrow(
+      /policies differ/,
+    );
+  });
 });
 
 describe("clampTtl", () => {

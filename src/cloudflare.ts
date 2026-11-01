@@ -36,6 +36,30 @@ export class CfClient {
   ) {}
 
   private async request<T>(method: string, path: string, body?: unknown, opts?: { tolerateNotFound?: boolean }): Promise<T> {
+    const { status, text, parsed } = await this.fetchEnvelope<T>(method, path, body, opts);
+    // A tolerated 404 (JSON or otherwise) means "already absent": success.
+    if (status === 404 && opts?.tolerateNotFound) {
+      return undefined as T;
+    }
+    this.throwOnError(method, path, status, text, parsed);
+    return parsed.result as T;
+  }
+
+  /**
+   * Raw envelope fetch shared by `request` and the paginated listers. The v4
+   * envelope carries pagination in `result_info` (sibling of `result`, not
+   * inside it), so callers that page need the whole envelope.
+   */
+  private async fetchEnvelope<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { tolerateNotFound?: boolean },
+  ): Promise<{
+    status: number;
+    text: string;
+    parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: T; result_info?: { cursor?: string } };
+  }> {
     const init: RequestInit = {
       method,
       headers: {
@@ -46,24 +70,40 @@ export class CfClient {
     };
     const res = await this.fetchImpl(`${CF_API}${path}`, init);
     const text = await res.text();
-    let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: T } = {};
+    let parsed: {
+      success?: boolean;
+      errors?: Array<{ message?: string }>;
+      result?: T;
+      result_info?: { cursor?: string };
+    } = {};
     try {
       parsed = text ? (JSON.parse(text) as typeof parsed) : {};
     } catch {
+      // A 404 with an HTML body still means "absent" on tolerant deletes;
+      // without this, teardown keeps the state record and retries forever.
+      if (opts?.tolerateNotFound && res.status === 404) {
+        return { status: res.status, text, parsed: {} };
+      }
       throw new CfError(res.status, text.slice(0, 500), `Cloudflare ${method} ${path}: non-JSON response ${res.status}`);
     }
-    if (!res.ok || parsed.success === false) {
-      // Teardown must be idempotent: a token that already expired (or was
-      // already revoked) and an already-deleted resource both return 404 on
-      // retry. Treat 404 on DELETE as success so envs can't get stuck in
-      // state forever and count against the concurrency cap.
-      if (opts?.tolerateNotFound && res.status === 404) {
-        return undefined as T;
-      }
-      const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
-      throw new CfError(res.status, text.slice(0, 500), `Cloudflare ${method} ${path} failed: ${res.status}${detail ? ` ${detail}` : ""}`);
-    }
-    return parsed.result as T;
+    return { status: res.status, text, parsed };
+  }
+
+  /** Throw unless the envelope is a successful 2xx response. */
+  private throwOnError(
+    method: string,
+    path: string,
+    status: number,
+    text: string,
+    parsed: { success?: boolean; errors?: Array<{ message?: string }> },
+  ): void {
+    // Teardown must be idempotent: a token that already expired (or was
+    // already revoked) and an already-deleted resource both return 404 on
+    // retry. Callers that tolerate it return early above, so reaching here
+    // with a 404 or a non-2xx is a real failure.
+    if (status >= 200 && status < 300 && parsed.success !== false) return;
+    const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
+    throw new CfError(status, text.slice(0, 500), `Cloudflare ${method} ${path} failed: ${status}${detail ? ` ${detail}` : ""}`);
   }
 
   // -- Workers ----------------------------------------------------------
@@ -239,11 +279,24 @@ export class CfClient {
    * Delete a single object. Per-object delete is used because the bulk
    * `DELETE .../objects` with a `{keys}` body could not be confirmed in the
    * v4 API; deleting per key is slower but definitely exists.
+   *
+   * Each `/` stays a literal path separator (the Delete Object reference
+   * requires `object_key` slashes unencoded — `%2F` addresses a different,
+   * missing object, whose 404-tolerant delete would silently leave the real
+   * object behind and wedge the bucket non-empty). Every other reserved
+   * character is encoded within its segment; `.`/`..` segments are escaped so
+   * URL parsing cannot normalise them away before the request is sent.
    */
   async deleteBucketObject(bucket: string, key: string): Promise<void> {
+    const encodedKey = key
+      .split("/")
+      .map((segment) =>
+        segment === "." ? "%2E" : segment === ".." ? "%2E%2E" : encodeURIComponent(segment),
+      )
+      .join("/");
     await this.request<unknown>(
       "DELETE",
-      `/accounts/${this.accountId}/r2/buckets/${bucket}/objects/${encodeURIComponent(key)}`,
+      `/accounts/${this.accountId}/r2/buckets/${bucket}/objects/${encodedKey}`,
       undefined,
       { tolerateNotFound: true },
     );
@@ -256,6 +309,11 @@ export class CfClient {
    * account already holds more buckets than one page, so every page is
    * followed (`per_page=1000` + cursor) — a single page could miss a name and
    * let provision adopt a foreign bucket.
+   *
+   * Any non-empty cursor means another page, whether or not the response sets
+   * `truncated`: the v4 list-buckets response can return a cursor without it.
+   * Pagination also lives in the envelope's `result_info.cursor`, not inside
+   * `result`, so both locations are read.
    */
   async listBuckets(): Promise<string[]> {
     const names: string[] = [];
@@ -263,16 +321,19 @@ export class CfClient {
     for (;;) {
       const params = new URLSearchParams({ per_page: "1000" });
       if (cursor) params.set("cursor", cursor);
-      const result = await this.request<{
+      const { status, text, parsed } = await this.fetchEnvelope<{
         buckets?: Array<{ name: string }>;
         truncated?: boolean;
         cursor?: string;
       }>("GET", `/accounts/${this.accountId}/r2/buckets?${params.toString()}`);
+      this.throwOnError("GET", `/accounts/${this.accountId}/r2/buckets`, status, text, parsed);
+      const result = parsed.result ?? {};
       for (const b of result.buckets ?? []) {
         if (typeof b.name === "string") names.push(b.name);
       }
-      if (!result.truncated || !result.cursor) break;
-      cursor = result.cursor;
+      const next = result.cursor || parsed.result_info?.cursor;
+      if (!next) break;
+      cursor = next;
     }
     return names;
   }

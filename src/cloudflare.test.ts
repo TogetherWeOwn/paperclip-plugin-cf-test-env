@@ -99,6 +99,53 @@ describe("CfClient", () => {
     expect(pages[0]!.query).toContain("per_page=1000");
   });
 
+  it("follows a cursor from result_info even when truncated is absent", async () => {
+    // The real v4 list-buckets response paginates via the envelope's
+    // result_info, not fields inside result.
+    const fake = new FakeCf();
+    fake.bucketListCursorViaResultInfo = true;
+    for (let i = 0; i < 2500; i++) {
+      fake.buckets.set(`pct-seed-${i}`, { objects: [] });
+    }
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    expect(await cf.listBuckets()).toHaveLength(2500);
+  });
+
+  it("treats a non-JSON 404 as success on tolerant deletes", async () => {
+    // Some edges answer 404 with an HTML body: still "already absent".
+    const cf = new CfClient(
+      async () => new Response("<html>not found</html>", { status: 404 }),
+      "mint",
+      "acct-1",
+    );
+    await cf.deleteWorkerScript("pct-gone");
+    await cf.deleteBucket("pct-gone");
+    await cf.deleteBucketObject("pct-gone", "k");
+    await cf.revokeAccountToken("tok-gone");
+  });
+
+  it("still throws on non-JSON responses that are not tolerated 404s", async () => {
+    const cf = new CfClient(
+      async () => new Response("<html>oops</html>", { status: 500 }),
+      "mint",
+      "acct-1",
+    );
+    await expect(cf.deleteWorkerScript("pct-x")).rejects.toMatchObject({ status: 500 });
+  });
+
+  it("deletes slash-containing keys with literal separators, not %2F", async () => {
+    const fake = new FakeCf();
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    await cf.createBucket("pct-slash");
+    fake.buckets.set("pct-slash", { objects: ["uploads/x.png", "plain"] });
+    await cf.deleteBucketObject("pct-slash", "uploads/x.png");
+    expect(fake.buckets.get("pct-slash")?.objects).toEqual(["plain"]);
+    // The request path keeps `/` as the separator between key segments.
+    const del = fake.calls.find((c) => c.method === "DELETE" && c.path.includes("/objects/"));
+    expect(del?.path).toContain("/objects/uploads/x.png");
+    expect(del?.path).not.toContain("%2F");
+  });
+
   it("CfError carries status and body", () => {
     const err = new CfError(403, "forbidden", "nope");
     expect(err.status).toBe(403);

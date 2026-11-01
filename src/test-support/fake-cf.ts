@@ -40,6 +40,19 @@ export class FakeCf {
    * unrecognised condition key. Provision must revoke and fail closed.
    */
   dropTokenConditionOnRead = false;
+  /**
+   * Rewrite the stored token body on read (applied after
+   * `dropTokenConditionOnRead`). Simulates the API storing broader grants
+   * than requested — e.g. a widened resource value or permission group.
+   * Provision must revoke and fail closed.
+   */
+  mutateTokenOnRead?: (body: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * When true, bucket-list pages carry the cursor in the envelope's
+   * `result_info` (like the real v4 response) instead of inside `result`, and
+   * omit `truncated`. The client must follow either location.
+   */
+  bucketListCursorViaResultInfo = false;
   private seq = 0;
 
   fetch = async (url: string, init?: RequestInit): Promise<Response> => {
@@ -53,11 +66,19 @@ export class FakeCf {
       body = String(init?.body);
     }
     this.calls.push({ method, path, query: parsed.searchParams.toString(), body });
-    const ok = (result: unknown) =>
-      new Response(JSON.stringify({ success: true, errors: [], result }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+    const ok = (result: unknown, resultInfo?: unknown) =>
+      new Response(
+        JSON.stringify({
+          success: true,
+          errors: [],
+          result,
+          ...(resultInfo === undefined ? {} : { result_info: resultInfo }),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     const apiError = (status: number, message: string) =>
       new Response(JSON.stringify({ success: false, errors: [{ message }], result: null }), {
         status,
@@ -111,10 +132,11 @@ export class FakeCf {
       const stored = this.tokens.get(id);
       if (!stored) return apiError(404, "token not found");
       const body = stored.body as Record<string, unknown>;
-      const result = this.dropTokenConditionOnRead
-        ? (({ condition: _dropped, ...rest }) => ({ id, ...rest }))(body)
-        : { id, ...body };
-      return ok(result);
+      const stripped = this.dropTokenConditionOnRead
+        ? (({ condition: _dropped, ...rest }) => rest)(body)
+        : { ...body };
+      const result = this.mutateTokenOnRead ? this.mutateTokenOnRead(stripped) : stripped;
+      return ok({ id, ...result });
     }
     if (m && method === "DELETE") {
       const id = decodeURIComponent(m[1]!);
@@ -160,11 +182,13 @@ export class FakeCf {
       return ok({});
     }
     // R2: cursor-paginated listing, per-object delete.
-    m = path.match(/^\/accounts\/[^/]+\/r2\/buckets\/([^/]+)\/objects\/([^/]+)$/);
+    // The key match is greedy across `/`: object keys contain literal
+    // separators, one segment per path element.
+    m = path.match(/^\/accounts\/[^/]+\/r2\/buckets\/([^/]+)\/objects\/(.+)$/);
     if (m && method === "DELETE") {
       const bucket = this.buckets.get(decodeURIComponent(m[1]!));
       if (!bucket) return apiError(404, "bucket not found");
-      const key = decodeURIComponent(m[2]!);
+      const key = m[2]!.split("/").map((s) => decodeURIComponent(s)).join("/");
       bucket.objects = bucket.objects.filter((k) => k !== key);
       return ok({});
     }
@@ -188,6 +212,13 @@ export class FakeCf {
       const start = Number(parsed.searchParams.get("cursor") ?? "0");
       const page = names.slice(start, start + perPage);
       const next = start + perPage;
+      if (this.bucketListCursorViaResultInfo) {
+        // Real v4 shape: cursor in the envelope's result_info, no truncated.
+        return ok(
+          { buckets: page.map((name) => ({ name })) },
+          ...(next < names.length ? [{ cursor: String(next) }] : [undefined]),
+        );
+      }
       return ok({
         buckets: page.map((name) => ({ name })),
         truncated: next < names.length,

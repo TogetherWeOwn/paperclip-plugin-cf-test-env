@@ -245,6 +245,34 @@ describe("provision", () => {
     expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
   });
 
+  it("revokes the minted token and fails closed when the stored policy is broader", async () => {
+    const { harness, fake, deps, run, issue } = await setup();
+    // The API stores broader grants than requested: same policy count, but a
+    // widened (whole-account) resource value on one policy and a different
+    // permission group on the other. The key-only check of round 2 would have
+    // passed the first; the whole-policy check must reject both.
+    fake.mutateTokenOnRead = (body) => {
+      const policies = (body.policies as Array<Record<string, unknown>>).map((p, i) =>
+        i === 0
+          ? { ...p, resources: { "com.cloudflare.api.account.acct-1": "*" } }
+          : { ...p, permission_groups: [{ id: "grp-something-broader" }] },
+      );
+      return { ...body, policies };
+    };
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/policies differ/);
+    // The token is revoked, no value ever reaches the caller, nothing leaks,
+    // and no record is kept.
+    expect(fake.revokedTokens).toHaveLength(1);
+    expect([...fake.tokens.values()]).toHaveLength(0);
+    expect(fake.scripts.size).toBe(0);
+    expect(fake.dbs.size).toBe(0);
+    expect(fake.namespaces.size).toBe(0);
+    expect(fake.buckets.size).toBe(0);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
   it("keeps parallel provisions from dropping index entries", async () => {
     const { harness, deps, run, issue } = await setup();
     const other = await harness.ctx.issues.create({
@@ -459,6 +487,39 @@ describe("sweep and issue.updated", () => {
     await harness.ctx.issues.update(issue.id, { status: "done" }, COMPANY);
     const result = await sweep(ctxOf(harness), config, COMPANY, deps);
     expect(result.tornDown).toEqual([provisioned.envId]);
+  });
+
+  it("handleIssueUpdated leaves young provisioning records for the sweep", async () => {
+    // A card closed while its provision is still running: tearing the
+    // provisioning record down now would pull the index out from under the
+    // run, and the later writes would land untracked and leak. Young records
+    // stay; the sweep reaps them once stale (or the finished run rolls back).
+    const { harness, deps } = await setup();
+    const config = resolveConfig({ ...baseConfig });
+    const envId = "pct-young-000000";
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: COMPANY, stateKey: `cf-test-env:env:${envId}` },
+      {
+        envId,
+        issueId: "issue-x",
+        companyId: COMPANY,
+        projectId: PROJ,
+        ownerAgentId: AGENT,
+        workerName: envId,
+        createdAt: new Date(NOW).toISOString(),
+        status: "provisioning",
+      },
+    );
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: COMPANY, stateKey: "cf-test-env:index" },
+      [envId],
+    );
+    await handleIssueUpdated(ctxOf(harness), config, COMPANY, "issue-x", "done", { ...deps, nowMs: NOW });
+    expect((await allEnvs(harness.ctx, COMPANY)).map((e) => e.envId)).toEqual([envId]);
+    // Once stale, the sweep finishes the rollback and drops the record.
+    const result = await sweep(ctxOf(harness), config, COMPANY, { ...deps, nowMs: NOW + 31 * 60 * 1000 });
+    expect(result.tornDown).toEqual([envId]);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
   });
 
   it("handleIssueUpdated only touches the closed card's envs", async () => {
