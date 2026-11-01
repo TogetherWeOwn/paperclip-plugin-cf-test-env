@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CfClient, CfError, isAuthenticationFailure } from "./cloudflare.js";
+import { CfClient, CfError, MissingWorkerTagError, isAuthenticationFailure } from "./cloudflare.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 describe("CfClient", () => {
@@ -7,7 +7,10 @@ describe("CfClient", () => {
     const fake = new FakeCf();
     const cf = new CfClient(fake.fetch, "mint", "acct-1");
     const worker = await cf.createWorkerScript("pct-test-aaa");
-    expect(worker.id).toBe("wid-pct-test-aaa");
+    // The real upload response carries id = script name plus a separate tag =
+    // Worker ID; the per-Worker token is scoped to the tag.
+    expect(worker.id).toBe("pct-test-aaa");
+    expect(worker.tag).toBe("tag-pct-test-aaa");
     const d1 = await cf.createD1("pct-test-aaa");
     expect(await cf.d1Query(d1.uuid, "select 1")).toBeDefined();
     const kv = await cf.createNamespace("pct-test-aaa");
@@ -54,12 +57,13 @@ describe("CfClient", () => {
     let seen: RequestInit | undefined;
     const cf = new CfClient(async (_url: string, init?: RequestInit) => {
       seen = init;
-      return new Response(JSON.stringify({ success: true, errors: [], result: { id: "wid-x", name: "x" } }), {
+      return new Response(JSON.stringify({ success: true, errors: [], result: { id: "pct-multi", tag: "tag-pct-multi" } }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
     }, "mint", "acct-1");
-    await cf.createWorkerScript("pct-multi");
+    const created = await cf.createWorkerScript("pct-multi");
+    expect(created.tag).toBe("tag-pct-multi");
     expect(seen?.method).toBe("PUT");
     expect(seen?.body).toBeInstanceOf(FormData);
     // fetch sets the multipart boundary itself; a JSON content-type would
@@ -198,11 +202,32 @@ describe("CfClient", () => {
     const cf = new CfClient(fake.fetch, "mint", "acct-1");
     expect(await cf.getWorkerScript("pct-missing")).toBeNull();
     await cf.createWorkerScript("pct-test-bbb");
-    expect(await cf.getWorkerScript("pct-test-bbb")).toEqual({ id: "wid-pct-test-bbb", name: "pct-test-bbb" });
+    expect(await cf.getWorkerScript("pct-test-bbb")).toEqual({ id: "pct-test-bbb", tag: "tag-pct-test-bbb", name: "pct-test-bbb" });
     // Existence goes through the JSON settings sub-resource, never the
     // script-content endpoint (which returns the body, not JSON).
     expect(fake.calls.some((c) => c.method === "GET" && c.path.endsWith("/settings"))).toBe(true);
     expect(fake.calls.some((c) => c.method === "GET" && /\/scripts\/[^/]+$/.test(c.path))).toBe(false);
+  });
+
+  it("fails closed when the upload response has no script tag", async () => {
+    // Scoping by script name is rejected by token creation (500 1004), so a
+    // tag-less upload must never reach the mint step. The dedicated error
+    // carries the script name so provision can delete the leaked Worker.
+    const cf = new CfClient(
+      async () =>
+        new Response(JSON.stringify({ success: true, errors: [], result: { id: "pct-notag", name: "pct-notag" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      "mint",
+      "acct-1",
+    );
+    const err = await cf.createWorkerScript("pct-notag").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(MissingWorkerTagError);
+    expect((err as MissingWorkerTagError).scriptName).toBe("pct-notag");
   });
 
   it("treats 404 on DELETE as success (idempotent teardown)", async () => {

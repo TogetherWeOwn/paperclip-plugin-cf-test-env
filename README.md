@@ -65,10 +65,23 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
   rejected instead of silently dropped.
 - Tests use an in-memory Cloudflare fixture (`src/test-support/fake-cf.ts`);
   no real Cloudflare calls run in CI.
-- Canary (merge gate): the operator verifies a minted token can run
-  `wrangler deploy` / `secret put` / `delete` on a stub Worker and gets 403 on
-  production Workers. If the real API's per-Worker resource shape differs
-  from `src/scoping.ts`, change only that file.
+- Canary (merge gate, verified 2026-11-01): the operator verifies a minted
+  token can run `wrangler deploy` / `secret put` / `delete` on a stub Worker
+  and gets 403 on production Workers. The per-Worker allowance MUST nest
+  under `com.cloudflare.api.account.<acct>` keyed on the script `tag` (the
+  Worker ID — `id` is the script name); a flat key fails token creation with
+  `500 1004`. The R2 allowance stays flat
+  (`com.cloudflare.edge.r2.bucket.<acct>_default_<bucket>`). If a new canary
+  shows the API shape drifted from `src/scoping.ts`, change only that file.
+- R2 writes (canary 2026-11-01, open question): `PUT
+  /accounts/<acct>/r2/buckets/<bucket>/objects/<key>` with the per-bucket
+  token returns `10000 Authentication error` — the REST object endpoint
+  rejects bucket-item tokens, so agents must NOT write objects via REST.
+  Whether `wrangler r2 object put` or the S3-compatible endpoint (access key
+  id = token id, secret = sha256(token value)) accepts this token is
+  unverified — confirm in a follow-up canary before relying on agent-driven
+  R2 writes. Provision/teardown empty and delete buckets with the minting
+  credential, which is unaffected.
 
 ## Development
 

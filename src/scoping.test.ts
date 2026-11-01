@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ACCOUNT_RESOURCE,
   assertMintedTokenMatches,
   buildTokenPolicies,
   buildTokenRequest,
@@ -30,7 +31,7 @@ describe("worker names", () => {
 describe("token policies", () => {
   const policies = buildTokenPolicies({
     accountId: "acct-1",
-    workerId: "wid-pct-abc",
+    workerTag: "tag-pct-abc",
     bucketName: "pct-abc",
     workerAdminGroupId: "grp-worker-admin",
     r2ItemWriteGroupId: "grp-r2-item-write",
@@ -40,7 +41,7 @@ describe("token policies", () => {
     expect(policies).toHaveLength(2);
     expect(policies[0]).toEqual({
       effect: "allow",
-      resources: { [`${WORKER_SCRIPT_RESOURCE}.wid-pct-abc`]: "*" },
+      resources: { [`${ACCOUNT_RESOURCE}.acct-1`]: { [`${WORKER_SCRIPT_RESOURCE}.tag-pct-abc`]: "*" } },
       permission_groups: [{ id: "grp-worker-admin" }],
     });
     expect(policies[1]).toEqual({
@@ -57,9 +58,20 @@ describe("token policies", () => {
     }
   });
 
-  it("resource builders emit the exact documented shapes", () => {
-    expect(workerResource("a", "w")).toEqual({ [`${WORKER_SCRIPT_RESOURCE}.w`]: "*" });
+  it("resource builders emit the exact canary-verified shapes", () => {
+    // Canary 2026-11-01: the Worker allowance MUST nest under the account key
+    // and key on the script tag — a flat key fails token creation (500 1004).
+    // The R2 allowance stays flat (nested is rejected with 400 1001).
+    expect(workerResource("a", "tag-w")).toEqual({
+      [`${ACCOUNT_RESOURCE}.a`]: { [`${WORKER_SCRIPT_RESOURCE}.tag-w`]: "*" },
+    });
     expect(r2BucketResource("a", "b")).toEqual({ [`${R2_BUCKET_RESOURCE}.a_default_b`]: "*" });
+  });
+
+  it("scopes the Worker to the script tag, never the script name", () => {
+    const serialized = JSON.stringify(workerResource("acct-1", "tag-pct-abc"));
+    expect(serialized).toContain("tag-pct-abc");
+    expect(serialized).not.toMatch(/script\.pct-/);
   });
 });
 
@@ -70,7 +82,7 @@ describe("token request", () => {
       name: "pct-x-token",
       policies: buildTokenPolicies({
         accountId: "a",
-        workerId: "w",
+        workerTag: "tag-w",
         bucketName: "b",
         workerAdminGroupId: "g1",
         r2ItemWriteGroupId: "g2",
@@ -87,7 +99,7 @@ describe("token request", () => {
   it("fails closed without egress CIDRs, with empty entries, or without policies", () => {
     const policies = buildTokenPolicies({
       accountId: "a",
-      workerId: "w",
+      workerTag: "tag-w",
       bucketName: "b",
       workerAdminGroupId: "g1",
       r2ItemWriteGroupId: "g2",
@@ -113,7 +125,7 @@ describe("token timestamps", () => {
 describe("assertMintedTokenMatches", () => {
   const policies = buildTokenPolicies({
     accountId: "a",
-    workerId: "w",
+    workerTag: "tag-w",
     bucketName: "b",
     workerAdminGroupId: "g1",
     r2ItemWriteGroupId: "g2",
@@ -171,8 +183,8 @@ describe("assertMintedTokenMatches", () => {
   });
 
   it("rejects a widened resource value even when the resource key matches", () => {
-    // The whole-account nesting the workerResource comment warns about: same
-    // top-level shape family, but the value covers everything.
+    // Same top-level account key as the legit nested Worker policy, but the
+    // string value covers the whole account instead of one script tag.
     const broadened = policies.map((p) => ({ ...p }));
     broadened[0] = {
       ...broadened[0]!,

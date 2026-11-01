@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Operator canary fixes: per-Worker token nests under
+  `com.cloudflare.api.account.<acct>` keyed on the script `tag` (flat keys
+  fail creation with `500 1004`); `createWorkerScript` returns the tag and
+  fails closed without it; provision scopes the token to the tag, never the
+  script name. R2 allowance stays flat. REST object PUT with the per-bucket
+  token returns `10000` — documented as a known-bad path; wrangler-vs-S3 for
+  agent R2 writes stays a follow-up canary question. Tag-less upload no
+  longer leaks the Worker: `MissingWorkerTagError` carries the script name
+  so provision deletes it by name (keeping the record for the sweep if that
+  delete fails).
+
 ## 0.1.1
 
 - Security review round 1: exact documented R2 per-bucket resource shape;

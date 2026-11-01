@@ -10,21 +10,23 @@
  * get account-wide D1/KV write: D1 goes through the `d1_execute` tool, which
  * the worker pins to the env's database id.
  *
- * CANARY NOTE: the exact Cloudflare resource-identifier strings below follow
- * the documented R2 shape (`com.cloudflare.edge.r2.bucket.<ACCOUNT>_<BUCKET>`
- * with value `"*"`, developers.cloudflare.com/r2/api/tokens, "Access Policy →
- * Bucket"). The per-Worker key is inferred by analogy
- * (`com.cloudflare.edge.worker.script.<WORKER_ID>` with value `"*"`) because
- * the Workers authorization docs don't publish the single-Worker key; confirm
- * it by reading the policy of a dashboard-made per-Worker token via
- * `GET /accounts/{id}/tokens/{tokenId}`. The merge gate requires the operator
- * to verify a minted token against the real API (deploy/secret/delete on the
- * stub Worker, 403 on production); if the API shape differs, change ONLY the
- * builders in this file.
+ * CANARY (operator, 2026-11-01): the exact Cloudflare resource shapes below
+ * are verified against the real API. A flat
+ * `com.cloudflare.edge.worker.script.<id>` key FAILS token creation with
+ * `500 1004 server error`, with either the script name or the tag as `<id>`;
+ * the per-Worker allowance MUST be nested under
+ * `com.cloudflare.api.account.<ACCOUNT>` and keyed on the script **tag**
+ * (the upload response returns `id` = script name plus a separate `tag` =
+ * Worker ID, e.g. `id=pct-canary`, `tag=3b278ba2...`). The flat R2 shape
+ * (`com.cloudflare.edge.r2.bucket.<ACCOUNT>_default_<BUCKET>` with value
+ * `"*"`, developers.cloudflare.com/r2/api/tokens, "Access Policy →
+ * Bucket"). Change the builders in this file only if
+ * a new canary shows the API shape drifted.
  */
 
 export const WORKER_SCRIPT_RESOURCE = "com.cloudflare.edge.worker.script";
 export const R2_BUCKET_RESOURCE = "com.cloudflare.edge.r2.bucket";
+export const ACCOUNT_RESOURCE = "com.cloudflare.api.account";
 
 /** Display names used to resolve permission group ids when no override is configured. */
 export const WORKER_ADMIN_GROUP_NAME = "Individual Workers Admin";
@@ -32,7 +34,7 @@ export const R2_ITEM_WRITE_GROUP_NAME = "Workers R2 Storage Bucket Item Write";
 
 export interface TokenPolicy {
   effect: "allow";
-  resources: Record<string, string>;
+  resources: Record<string, string | Record<string, string>>;
   permission_groups: Array<{ id: string }>;
 }
 
@@ -72,14 +74,19 @@ export function workerNameFor(prefix: string, issueId: string, randHex: string):
 }
 
 /**
- * Per-Worker resource: `<type>.<workerId>` with value `"*"`, mirroring the
- * documented R2 shape. The per-Worker allowance applies to this Worker only.
- * `accountId` is kept so the key can be re-nested under
- * `com.cloudflare.api.account.<id>` if the canary shows Cloudflare requires it.
+ * Per-Worker resource, canary-verified 2026-11-01: the script tag nested under
+ * the account key, `{ "com.cloudflare.api.account.<acct>":
+ * { "com.cloudflare.edge.worker.script.<tag>": "*" } }`. A flat
+ * `com.cloudflare.edge.worker.script.<id>` key — with either the script name
+ * or the tag — is rejected by token creation (`500 1004`). The per-Worker
+ * allowance applies to this Worker only. `workerTag` is the script `tag`
+ * from the upload response, NOT the `id` (which is the script name).
  */
-export function workerResource(accountId: string, workerId: string): Record<string, string> {
-  void accountId;
-  return { [`${WORKER_SCRIPT_RESOURCE}.${workerId}`]: "*" };
+export function workerResource(
+  accountId: string,
+  workerTag: string,
+): Record<string, Record<string, string>> {
+  return { [`${ACCOUNT_RESOURCE}.${accountId}`]: { [`${WORKER_SCRIPT_RESOURCE}.${workerTag}`]: "*" } };
 }
 
 /**
@@ -92,7 +99,8 @@ export function r2BucketResource(accountId: string, bucketName: string): Record<
 
 export function buildTokenPolicies(opts: {
   accountId: string;
-  workerId: string;
+  /** Script `tag` from the upload response (the Worker ID), NOT the `id` (script name). */
+  workerTag: string;
   bucketName: string;
   workerAdminGroupId: string;
   r2ItemWriteGroupId: string;
@@ -100,7 +108,7 @@ export function buildTokenPolicies(opts: {
   return [
     {
       effect: "allow",
-      resources: workerResource(opts.accountId, opts.workerId),
+      resources: workerResource(opts.accountId, opts.workerTag),
       permission_groups: [{ id: opts.workerAdminGroupId }],
     },
     {

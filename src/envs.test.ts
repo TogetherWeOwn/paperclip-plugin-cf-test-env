@@ -3,7 +3,7 @@ import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "./manifest.js";
 import { resolveConfig } from "./config.js";
 import { allEnvs, d1Execute, handleIssueUpdated, liveEnvs, provision, sweep, teardown } from "./envs.js";
-import { R2_BUCKET_RESOURCE, WORKER_SCRIPT_RESOURCE, workerNameFor } from "./scoping.js";
+import { ACCOUNT_RESOURCE, R2_BUCKET_RESOURCE, WORKER_SCRIPT_RESOURCE, workerNameFor } from "./scoping.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 const COMPANY = "c-1";
@@ -62,7 +62,11 @@ describe("provision", () => {
     expect(policies).toEqual([
       {
         effect: "allow",
-        resources: { [`${WORKER_SCRIPT_RESOURCE}.wid-${result.workerName}`]: "*" },
+        // Canary-verified: nested under the account key, keyed on the script
+        // tag (the Worker ID) — never the script name, never flat.
+        resources: {
+          [`${ACCOUNT_RESOURCE}.acct-1`]: { [`${WORKER_SCRIPT_RESOURCE}.tag-${result.workerName}`]: "*" },
+        },
         permission_groups: [{ id: "grp-worker-admin" }],
       },
       {
@@ -139,6 +143,42 @@ describe("provision", () => {
     expect([...fake.tokens.keys()]).toHaveLength(0);
     expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
     expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
+  it("deletes the Worker by name when the upload returns no tag, and drops the record", async () => {
+    // A 200 upload without a tag means the Worker exists but no token can
+    // scope to it: provision must fail closed AND leave nothing behind.
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.omitScriptTagOnPut = true;
+    const name = workerNameFor("pct-", issue.id, "abc123");
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/no script tag/);
+    expect(fake.scripts.has(name)).toBe(false);
+    expect([...fake.tokens.keys()]).toHaveLength(0);
+    expect(await liveEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(0);
+  });
+
+  it("keeps the provisioning record for the sweep when tag-less cleanup fails", async () => {
+    const { harness, fake, deps, run, issue } = await setup();
+    fake.omitScriptTagOnPut = true;
+    const name = workerNameFor("pct-", issue.id, "abc123");
+    fake.failOn = [`DELETE /accounts/acct-1/workers/scripts/${name}`];
+    await expect(
+      provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
+    ).rejects.toThrow(/no script tag.*rollback incomplete/);
+    // The leaked Worker is still there and the record is kept so the sweep
+    // retries the delete by name.
+    expect(fake.scripts.has(name)).toBe(true);
+    expect(await allEnvs(harness.ctx, COMPANY)).toHaveLength(1);
+    fake.failOn = [];
+    const swept = await sweep(ctxOf(harness), resolveConfig({ ...baseConfig }), COMPANY, {
+      ...deps,
+      nowMs: NOW + 24 * 3600 * 1000,
+    });
+    expect(swept.errors).toHaveLength(0);
+    expect(fake.scripts.has(name)).toBe(false);
   });
 
   it("rejects non-allow-listed projects and full caps without Cloudflare calls", async () => {
