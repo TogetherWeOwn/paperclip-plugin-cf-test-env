@@ -31,7 +31,9 @@ const plugin = definePlugin({
           const result = await provision(ctx, config, runCtx, { issueId: input.issueId, ttlSeconds: input.ttlSeconds }, {
             fetchImpl: (url, init) => ctx.http.fetch(url, init),
           });
-          // The token travels in the tool result only: never state, docs, or logs.
+          // The token travels in the tool result only: never plugin state or
+          // issue documents. It does appear in the run transcript, bounded by
+          // its TTL and IP filter.
           return {
             data: result,
             content: [
@@ -56,6 +58,10 @@ const plugin = definePlugin({
           properties: {
             envId: { type: "string" },
             sql: { type: "string" },
+            params: {
+              type: "array",
+              description: "Optional bound parameters for the SQL.",
+            },
           },
           required: ["envId", "sql"],
         },
@@ -94,9 +100,17 @@ const plugin = definePlugin({
           const config = resolveConfig(await ctx.config.get(runCtx.companyId));
           const input = (params ?? {}) as { envId?: string };
           if (typeof input.envId !== "string" || !input.envId) return { error: "envId is required." };
-          const { errors } = await teardown(ctx, config, runCtx.companyId, input.envId, {
-            fetchImpl: (url, init) => ctx.http.fetch(url, init),
-          });
+          const { errors } = await teardown(
+            ctx,
+            config,
+            runCtx.companyId,
+            input.envId,
+            {
+              fetchImpl: (url, init) => ctx.http.fetch(url, init),
+            },
+            // Agent-initiated: enforce the owner/assignee + allow-list gate.
+            { agentId: runCtx.agentId },
+          );
           if (errors.length > 0) return { error: `Teardown incomplete: ${errors.join("; ").slice(0, 1000)}` };
           return { content: `Test env ${input.envId} torn down.` };
         } catch (err) {

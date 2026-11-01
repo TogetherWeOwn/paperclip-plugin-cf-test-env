@@ -10,12 +10,17 @@
  * get account-wide D1/KV write: D1 goes through the `d1_execute` tool, which
  * the worker pins to the env's database id.
  *
- * CANARY NOTE: the exact Cloudflare resource-identifier strings below
- * (`com.cloudflare.edge.worker.script` nested `accountId/workerId`, and the
- * R2 bucket resource) encode the operator's 2026-11-01 research. The merge
- * gate requires the operator to verify a minted token against the real API
- * (deploy/secret/delete on the stub Worker, 403 on production); if the API
- * shape differs, change ONLY the builders in this file.
+ * CANARY NOTE: the exact Cloudflare resource-identifier strings below follow
+ * the documented R2 shape (`com.cloudflare.edge.r2.bucket.<ACCOUNT>_<BUCKET>`
+ * with value `"*"`, developers.cloudflare.com/r2/api/tokens, "Access Policy →
+ * Bucket"). The per-Worker key is inferred by analogy
+ * (`com.cloudflare.edge.worker.script.<WORKER_ID>` with value `"*"`) because
+ * the Workers authorization docs don't publish the single-Worker key; confirm
+ * it by reading the policy of a dashboard-made per-Worker token via
+ * `GET /accounts/{id}/tokens/{tokenId}`. The merge gate requires the operator
+ * to verify a minted token against the real API (deploy/secret/delete on the
+ * stub Worker, 403 on production); if the API shape differs, change ONLY the
+ * builders in this file.
  */
 
 export const WORKER_SCRIPT_RESOURCE = "com.cloudflare.edge.worker.script";
@@ -61,14 +66,23 @@ export function workerNameFor(prefix: string, issueId: string, randHex: string):
   return name;
 }
 
-/** `accountId/workerId` nesting: the per-Worker role applies to this Worker only. */
+/**
+ * Per-Worker resource: `<type>.<workerId>` with value `"*"`, mirroring the
+ * documented R2 shape. The per-Worker allowance applies to this Worker only.
+ * `accountId` is kept so the key can be re-nested under
+ * `com.cloudflare.api.account.<id>` if the canary shows Cloudflare requires it.
+ */
 export function workerResource(accountId: string, workerId: string): Record<string, string> {
-  return { [WORKER_SCRIPT_RESOURCE]: `${accountId}/${workerId}` };
+  void accountId;
+  return { [`${WORKER_SCRIPT_RESOURCE}.${workerId}`]: "*" };
 }
 
-/** `accountId/bucketName` nesting: Item Write applies to this bucket only. */
+/**
+ * Documented R2 shape: `com.cloudflare.edge.r2.bucket.<ACCOUNT>_default_<BUCKET>`
+ * with value `"*"`. Item Write applies to this bucket only.
+ */
 export function r2BucketResource(accountId: string, bucketName: string): Record<string, string> {
-  return { [R2_BUCKET_RESOURCE]: `${accountId}/${bucketName}` };
+  return { [`${R2_BUCKET_RESOURCE}.${accountId}_default_${bucketName}`]: "*" };
 }
 
 export function buildTokenPolicies(opts: {

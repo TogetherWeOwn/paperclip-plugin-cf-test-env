@@ -2,14 +2,13 @@
 
 A [Paperclip](https://github.com/paperclipai/paperclip) plugin that gives agents
 disposable Cloudflare test envs — one `pct-*` Worker plus its D1/KV/R2 — with
-a per-Worker short-lived token, so test deploys (like TWO-725) run entirely
+a per-Worker short-lived token, so agent test deploys run entirely
 inside Paperclip with no way to touch production.
 
 ## Why this shape
 
-The account holds production (35 Workers incl. `two-web-next-production`,
-9 D1s, 9 KVs, 20 R2 buckets). A standing account-wide "Workers Scripts Write"
-token could overwrite production, so:
+The Cloudflare account also holds production Workers and data. A standing
+account-wide "Workers Scripts Write" token could overwrite production, so:
 
 - The plugin mints **account-owned tokens** carrying exactly two allowances:
   **Individual Workers Admin on ONE Worker id** (deploy, rollback, secret
@@ -51,8 +50,9 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
 
 ## Security notes
 
-- The token value is returned in the tool result only. It is never written to
-  plugin state, issue documents, or logs.
+- The token value is not persisted by the plugin: it is returned in the tool
+  result only, never written to plugin state or issue documents. It does
+  appear in the run transcript, bounded by its short TTL and IP filter.
 - Teardown revokes the token before deleting resources, so a leaked token
   dies even if deletion fails.
 - Tests use an in-memory Cloudflare fixture (`src/test-support/fake-cf.ts`);

@@ -13,6 +13,8 @@ const config = {
   accountId: "acct-1",
   allowedProjectIds: [PROJ],
   egressCidr: "203.0.113.0/24",
+  workerAdminGroupId: "grp-worker-admin",
+  r2ItemWriteGroupId: "grp-r2-item-write",
 };
 
 async function setup() {

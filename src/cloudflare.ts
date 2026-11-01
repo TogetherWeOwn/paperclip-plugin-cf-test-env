@@ -35,7 +35,7 @@ export class CfClient {
     readonly accountId: string,
   ) {}
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, opts?: { tolerateNotFound?: boolean }): Promise<T> {
     const init: RequestInit = {
       method,
       headers: {
@@ -53,6 +53,13 @@ export class CfClient {
       throw new CfError(res.status, text.slice(0, 500), `Cloudflare ${method} ${path}: non-JSON response ${res.status}`);
     }
     if (!res.ok || parsed.success === false) {
+      // Teardown must be idempotent: a token that already expired (or was
+      // already revoked) and an already-deleted resource both return 404 on
+      // retry. Treat 404 on DELETE as success so envs can't get stuck in
+      // state forever and count against the concurrency cap.
+      if (opts?.tolerateNotFound && res.status === 404) {
+        return undefined as T;
+      }
       const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
       throw new CfError(res.status, text.slice(0, 500), `Cloudflare ${method} ${path} failed: ${res.status}${detail ? ` ${detail}` : ""}`);
     }
@@ -71,13 +78,34 @@ export class CfClient {
   }
 
   async deleteWorkerScript(name: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/workers/scripts/${name}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/workers/scripts/${name}`, undefined, {
+      tolerateNotFound: true,
+    });
+  }
+
+  /**
+   * Fetch script metadata. Returns null when the script doesn't exist (404),
+   * so provision can fail closed instead of silently overwriting a
+   * pre-existing Worker with a PUT.
+   */
+  async getWorkerScript(name: string): Promise<{ id: string } | null> {
+    try {
+      return await this.request<{ id: string }>(
+        "GET",
+        `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(name)}`,
+      );
+    } catch (err) {
+      if (err instanceof CfError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   // -- API tokens ---------------------------------------------------------
 
   async getPermissionGroups(): Promise<PermissionGroup[]> {
-    return this.request<PermissionGroup[]>("GET", "/user/tokens/permission_groups");
+    // The minting credential is account-owned, so permission groups resolve
+    // under the account — not under /user, which belongs to user tokens.
+    return this.request<PermissionGroup[]>("GET", `/accounts/${this.accountId}/tokens/permission_groups`);
   }
 
   async resolvePermissionGroupId(name: string, overrideId: string): Promise<string> {
@@ -99,7 +127,9 @@ export class CfClient {
   }
 
   async revokeAccountToken(tokenId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/tokens/${tokenId}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/tokens/${tokenId}`, undefined, {
+      tolerateNotFound: true,
+    });
   }
 
   // -- D1 -----------------------------------------------------------------
@@ -109,7 +139,9 @@ export class CfClient {
   }
 
   async deleteD1(databaseId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/d1/database/${databaseId}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/d1/database/${databaseId}`, undefined, {
+      tolerateNotFound: true,
+    });
   }
 
   async d1Query(databaseId: string, sql: string, params?: unknown[]): Promise<unknown> {
@@ -127,7 +159,12 @@ export class CfClient {
   }
 
   async deleteNamespace(namespaceId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/storage/kv/namespaces/${namespaceId}`);
+    await this.request<unknown>(
+      "DELETE",
+      `/accounts/${this.accountId}/storage/kv/namespaces/${namespaceId}`,
+      undefined,
+      { tolerateNotFound: true },
+    );
   }
 
   // -- R2 -----------------------------------------------------------------
@@ -136,20 +173,41 @@ export class CfClient {
     await this.request<unknown>("PUT", `/accounts/${this.accountId}/r2/buckets/${name}`);
   }
 
-  async listBucketObjects(bucket: string): Promise<Array<{ key: string }>> {
-    const result = await this.request<{ objects?: Array<{ key: string }> }>(
-      "GET",
-      `/accounts/${this.accountId}/r2/buckets/${bucket}/objects?limit=1000`,
-    );
-    return result.objects ?? [];
+  /**
+   * One page of bucket objects. The cursor returned here feeds the next
+   * call; `truncated` false means the bucket is fully listed.
+   */
+  async listBucketObjects(
+    bucket: string,
+    cursor?: string,
+  ): Promise<{ objects: Array<{ key: string }>; truncated: boolean; cursor?: string }> {
+    const params = new URLSearchParams({ limit: "1000" });
+    if (cursor) params.set("cursor", cursor);
+    const result = await this.request<{
+      objects?: Array<{ key: string }>;
+      truncated?: boolean;
+      cursor?: string;
+    }>("GET", `/accounts/${this.accountId}/r2/buckets/${bucket}/objects?${params.toString()}`);
+    return { objects: result.objects ?? [], truncated: result.truncated ?? false, cursor: result.cursor };
   }
 
-  async deleteBucketObjects(bucket: string, keys: string[]): Promise<void> {
-    if (keys.length === 0) return;
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${bucket}/objects`, { keys });
+  /**
+   * Delete a single object. Per-object delete is used because the bulk
+   * `DELETE .../objects` with a `{keys}` body could not be confirmed in the
+   * v4 API; deleting per key is slower but definitely exists.
+   */
+  async deleteBucketObject(bucket: string, key: string): Promise<void> {
+    await this.request<unknown>(
+      "DELETE",
+      `/accounts/${this.accountId}/r2/buckets/${bucket}/objects/${encodeURIComponent(key)}`,
+      undefined,
+      { tolerateNotFound: true },
+    );
   }
 
   async deleteBucket(name: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${name}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${name}`, undefined, {
+      tolerateNotFound: true,
+    });
   }
 }

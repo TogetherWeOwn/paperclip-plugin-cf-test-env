@@ -55,4 +55,41 @@ describe("CfClient", () => {
     expect(err.status).toBe(403);
     expect(err.body).toBe("forbidden");
   });
+
+  it("reads worker metadata and returns null for missing scripts", async () => {
+    const fake = new FakeCf();
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    expect(await cf.getWorkerScript("pct-missing")).toBeNull();
+    await cf.createWorkerScript("pct-test-bbb");
+    expect(await cf.getWorkerScript("pct-test-bbb")).toEqual({ id: "wid-pct-test-bbb", name: "pct-test-bbb" });
+  });
+
+  it("treats 404 on DELETE as success (idempotent teardown)", async () => {
+    const fake = new FakeCf();
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    await cf.deleteWorkerScript("pct-gone");
+    await cf.deleteD1("d1-gone");
+    await cf.deleteNamespace("kv-gone");
+    await cf.deleteBucket("pct-gone");
+    await cf.revokeAccountToken("tok-gone");
+    await cf.deleteBucketObject("pct-gone-bucket", "k");
+  });
+
+  it("paginates R2 listing with cursors and deletes per object", async () => {
+    const fake = new FakeCf();
+    const cf = new CfClient(fake.fetch, "mint", "acct-1");
+    await cf.createBucket("pct-big");
+    fake.buckets.set("pct-big", { objects: Array.from({ length: 2500 }, (_, i) => `k-${i}`) });
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await cf.listBucketObjects("pct-big", cursor);
+      seen.push(...page.objects.map((o) => o.key));
+      if (!page.truncated || !page.cursor) break;
+      cursor = page.cursor;
+    }
+    expect(seen).toHaveLength(2500);
+    await cf.deleteBucketObject("pct-big", "k-0");
+    expect(fake.buckets.get("pct-big")?.objects).toHaveLength(2499);
+  });
 });

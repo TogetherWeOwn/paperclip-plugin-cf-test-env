@@ -38,26 +38,26 @@ describe("token policies", () => {
     expect(policies).toHaveLength(2);
     expect(policies[0]).toEqual({
       effect: "allow",
-      resources: { [WORKER_SCRIPT_RESOURCE]: "acct-1/wid-pct-abc" },
+      resources: { [`${WORKER_SCRIPT_RESOURCE}.wid-pct-abc`]: "*" },
       permission_groups: [{ id: "grp-worker-admin" }],
     });
     expect(policies[1]).toEqual({
       effect: "allow",
-      resources: { [R2_BUCKET_RESOURCE]: "acct-1/pct-abc" },
+      resources: { [`${R2_BUCKET_RESOURCE}.acct-1_default_pct-abc`]: "*" },
       permission_groups: [{ id: "grp-r2-item-write" }],
     });
   });
 
-  it("never references production workers", () => {
+  it("never references other workers or buckets", () => {
     const serialized = JSON.stringify(policies);
-    for (const prod of ["two-web-next-production", "two-bot-next-production", "dropway"]) {
-      expect(serialized).not.toContain(prod);
+    for (const other of ["prod-worker-alpha", "prod-worker-beta", "shared-bucket"]) {
+      expect(serialized).not.toContain(other);
     }
   });
 
-  it("resource builders nest the worker id under the account", () => {
-    expect(workerResource("a", "w")).toEqual({ [WORKER_SCRIPT_RESOURCE]: "a/w" });
-    expect(r2BucketResource("a", "b")).toEqual({ [R2_BUCKET_RESOURCE]: "a/b" });
+  it("resource builders emit the exact documented shapes", () => {
+    expect(workerResource("a", "w")).toEqual({ [`${WORKER_SCRIPT_RESOURCE}.w`]: "*" });
+    expect(r2BucketResource("a", "b")).toEqual({ [`${R2_BUCKET_RESOURCE}.a_default_b`]: "*" });
   });
 });
 

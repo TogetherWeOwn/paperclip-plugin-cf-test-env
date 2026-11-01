@@ -17,6 +17,17 @@ export const DEFAULT_NAME_PREFIX = "pct-";
 export const DEFAULT_MAX_TTL_SECONDS = 10800; // 3 h
 export const DEFAULT_MAX_CONCURRENT_ENVS = 10;
 
+/**
+ * Allowed `namePrefix` values: lowercase, short, and always dash-terminated.
+ * The pattern keeps provisioned names attributable (`pct-*`) and rejects
+ * prefixes that could collide with real (non-test) Workers.
+ */
+export const NAME_PREFIX_RE = /^[a-z][a-z0-9]{1,10}-$/;
+
+export function isValidNamePrefix(prefix: string): boolean {
+  return NAME_PREFIX_RE.test(prefix);
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -44,7 +55,9 @@ export function resolveConfig(raw: Record<string, unknown>): CfTestEnvConfig {
     accountId: typeof raw.accountId === "string" ? raw.accountId.trim() : "",
     allowedProjectIds: stringArray(raw.allowedProjectIds),
     namePrefix: prefix,
-    maxTtlSeconds: intOr(raw.maxTtlSeconds, DEFAULT_MAX_TTL_SECONDS),
+    // Hard cap: the issue requires expiry within 3 h, so a larger configured
+    // max is clamped rather than honoured.
+    maxTtlSeconds: Math.min(intOr(raw.maxTtlSeconds, DEFAULT_MAX_TTL_SECONDS), DEFAULT_MAX_TTL_SECONDS),
     maxConcurrentEnvs: intOr(raw.maxConcurrentEnvs, DEFAULT_MAX_CONCURRENT_ENVS),
     egressCidr: typeof raw.egressCidr === "string" ? raw.egressCidr.trim() : "",
     workerAdminGroupId:
@@ -62,14 +75,17 @@ export interface ConfigError {
     | "concurrency_cap"
     | "not_assignee"
     | "ttl_too_long"
-    | "issue_not_found";
+    | "issue_not_found"
+    | "bad_prefix";
   message: string;
 }
 
 /**
  * Fail-closed gate for provisioning. Returns null when provisioning may
- * proceed. Missing minting credential, account, egress CIDR or allow-list
- * all block provisioning before any Cloudflare call is made.
+ * proceed. Missing minting credential, account, egress CIDR, permission-group
+ * ids or allow-list all block provisioning before any Cloudflare call is made.
+ * `liveCount` covers every tracked env (live plus in-progress provisioning),
+ * so repeated failed provisions can't bypass the concurrency cap either.
  */
 export function checkProvisionAllowed(
   config: CfTestEnvConfig,
@@ -77,6 +93,18 @@ export function checkProvisionAllowed(
 ): ConfigError | null {
   if (!config.tokenSecretRef || !config.accountId || !config.egressCidr) {
     return { code: "not_configured", message: "cf-test-env is not configured; cannot provision." };
+  }
+  if (!config.workerAdminGroupId || !config.r2ItemWriteGroupId) {
+    return {
+      code: "not_configured",
+      message: "cf-test-env permission group ids are not configured; refusing to mint a token.",
+    };
+  }
+  if (!isValidNamePrefix(config.namePrefix)) {
+    return {
+      code: "bad_prefix",
+      message: `cf-test-env namePrefix ${JSON.stringify(config.namePrefix)} is invalid; refusing to provision.`,
+    };
   }
   if (config.allowedProjectIds.length === 0 || !config.allowedProjectIds.includes(opts.projectId)) {
     return { code: "project_not_allowed", message: "This project is not allow-listed for cf-test-env." };
