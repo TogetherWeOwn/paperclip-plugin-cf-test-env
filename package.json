@@ -1,0 +1,55 @@
+{
+  "name": "@togetherweown/paperclip-plugin-cf-test-env",
+  "version": "0.1.0",
+  "description": "Paperclip plugin: per-card disposable Cloudflare test envs (pct-*) with per-Worker short-lived tokens. Agents deploy test Workers without touching production.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/TogetherWeOwn/paperclip-plugin-cf-test-env",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TogetherWeOwn/paperclip-plugin-cf-test-env"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "cloudflare",
+    "workers",
+    "test-env"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1023.0",
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
