@@ -40,6 +40,7 @@ const plugin = definePlugin({
               `Test env ${result.workerName} ready (expires ${result.expiresAt}).`,
               `CLOUDFLARE_API_TOKEN=<token from data> CLOUDFLARE_ACCOUNT_ID=${result.accountId}`,
               `Deploy with wrangler to worker ${result.workerName} only. Never touch other workers.`,
+              `R2: do not PUT objects via REST with this token (rejected); agent R2 writes stay unverified.`,
             ].join("\n"),
           };
         } catch (err) {

@@ -247,9 +247,10 @@ export async function provision(
     if ((await cf.listBuckets()).includes(workerName)) {
       throw new Error(`R2 bucket ${workerName} already exists; refusing to adopt it.`);
     }
-    // Create resources first: the per-Worker token needs the Worker id.
+    // Create resources first: the per-Worker token is scoped to the script
+    // tag (the Worker ID), not the script name — see workerResource.
     const worker = await cf.createWorkerScript(workerName);
-    progress.workerId = worker.id;
+    progress.workerId = worker.tag;
     await saveProgress();
     const d1 = await cf.createD1(workerName);
     progress.d1Id = d1.uuid;
@@ -265,7 +266,7 @@ export async function provision(
     // above): no runtime lookup by display name.
     const policies = buildTokenPolicies({
       accountId: config.accountId,
-      workerId: worker.id,
+      workerTag: worker.tag,
       bucketName: workerName,
       workerAdminGroupId: config.workerAdminGroupId,
       r2ItemWriteGroupId: config.r2ItemWriteGroupId,
@@ -298,7 +299,7 @@ export async function provision(
       projectId,
       ownerAgentId: run.agentId,
       workerName,
-      workerId: worker.id,
+      workerId: worker.tag,
       d1Id: d1.uuid,
       kvId: kv.id,
       r2Bucket: workerName,

@@ -153,12 +153,13 @@ export class CfClient {
   /**
    * Upload a stub script. The script-upload endpoint takes multipart/form-data
    * (a `metadata` part plus the module), not JSON — a JSON body is rejected.
-   * Returns the Worker id the per-Worker role is keyed on. (The classic script
-   * API returns the script name as `id` plus a separate `tag`; provision uses
-   * the returned `id` for scoping and the canary confirms it against the real
-   * API.)
+   * Returns the script `id` (the script name, used for deploys and deletes)
+   * plus the `tag` (the Worker ID the per-Worker token role is keyed on —
+   * canary-verified 2026-11-01: scoping by name or by a flat tag key fails
+   * token creation with `500 1004`). Fails closed when the tag is missing:
+   * minting a token without it could never scope to this Worker.
    */
-  async createWorkerScript(name: string): Promise<{ id: string }> {
+  async createWorkerScript(name: string): Promise<{ id: string; tag: string }> {
     const stub = `export default { async fetch() { return new Response("pct stub", { status: 200 }); } };`;
     const form = new FormData();
     form.set(
@@ -174,9 +175,9 @@ export class CfClient {
       body: form,
     });
     const text = await res.text();
-    let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: { id: string } } = {};
+    let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: { id: string; tag: string } } = {};
     try {
-      parsed = text ? asEnvelope<{ id: string }>(JSON.parse(text)) : {};
+      parsed = text ? asEnvelope<{ id: string; tag: string }>(JSON.parse(text)) : {};
     } catch {
       throw new CfError(res.status, text.slice(0, 500), `Cloudflare PUT workers/scripts/${name}: non-JSON response ${res.status}`);
     }
@@ -188,7 +189,14 @@ export class CfClient {
         `Cloudflare PUT workers/scripts/${name} failed: ${res.status}${detail ? ` ${detail}` : ""}`,
       );
     }
-    return parsed.result as { id: string };
+    if (!parsed.result || typeof parsed.result.tag !== "string" || !parsed.result.tag) {
+      throw new CfError(
+        res.status,
+        text.slice(0, 500),
+        `Cloudflare PUT workers/scripts/${name}: response has no script tag; refusing to scope a token without it`,
+      );
+    }
+    return parsed.result;
   }
 
   async deleteWorkerScript(name: string): Promise<void> {

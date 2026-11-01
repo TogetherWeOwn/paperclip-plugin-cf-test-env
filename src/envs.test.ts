@@ -3,7 +3,7 @@ import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "./manifest.js";
 import { resolveConfig } from "./config.js";
 import { allEnvs, d1Execute, handleIssueUpdated, liveEnvs, provision, sweep, teardown } from "./envs.js";
-import { R2_BUCKET_RESOURCE, WORKER_SCRIPT_RESOURCE, workerNameFor } from "./scoping.js";
+import { ACCOUNT_RESOURCE, R2_BUCKET_RESOURCE, WORKER_SCRIPT_RESOURCE, workerNameFor } from "./scoping.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 const COMPANY = "c-1";
@@ -62,7 +62,11 @@ describe("provision", () => {
     expect(policies).toEqual([
       {
         effect: "allow",
-        resources: { [`${WORKER_SCRIPT_RESOURCE}.wid-${result.workerName}`]: "*" },
+        // Canary-verified: nested under the account key, keyed on the script
+        // tag (the Worker ID) — never the script name, never flat.
+        resources: {
+          [`${ACCOUNT_RESOURCE}.acct-1`]: { [`${WORKER_SCRIPT_RESOURCE}.tag-${result.workerName}`]: "*" },
+        },
         permission_groups: [{ id: "grp-worker-admin" }],
       },
       {

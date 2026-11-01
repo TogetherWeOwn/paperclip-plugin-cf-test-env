@@ -20,7 +20,7 @@ export interface RecordedCall {
 
 export class FakeCf {
   readonly calls: RecordedCall[] = [];
-  scripts = new Map<string, { id: string }>();
+  scripts = new Map<string, { id: string; tag: string }>();
   dbs = new Map<string, { name: string }>();
   namespaces = new Map<string, { title: string }>();
   buckets = new Map<string, { objects: string[] }>();
@@ -110,11 +110,13 @@ export class FakeCf {
     let m = path.match(/^\/accounts\/[^/]+\/workers\/scripts\/([^/]+)$/);
     if (m && method === "PUT") {
       // Accepts the real multipart upload (body is FormData, not JSON); the
-      // fake only tracks existence by name from the path.
+      // fake only tracks existence by name from the path. Like the real API,
+      // the response carries `id` = script name plus a separate `tag` =
+      // Worker ID, which is what the per-Worker token is scoped to.
       const name = decodeURIComponent(m[1]!);
-      const id = `wid-${name}`;
-      this.scripts.set(name, { id });
-      return ok({ id, name });
+      const tag = `tag-${name}`;
+      this.scripts.set(name, { id: name, tag });
+      return ok({ id: name, tag, name });
     }
     const settings = path.match(/^\/accounts\/[^/]+\/workers\/scripts\/([^/]+)\/settings$/);
     if (settings && method === "GET") {
@@ -123,7 +125,7 @@ export class FakeCf {
       const name = decodeURIComponent(settings[1]!);
       const script = this.scripts.get(name);
       if (!script) return apiError(404, "script not found");
-      return ok({ id: script.id, name });
+      return ok({ id: script.id, tag: script.tag, name });
     }
     if (m && method === "DELETE") {
       const name = decodeURIComponent(m[1]!);
