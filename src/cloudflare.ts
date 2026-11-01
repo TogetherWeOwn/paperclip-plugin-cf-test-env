@@ -35,7 +35,31 @@ export class CfClient {
     readonly accountId: string,
   ) {}
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, opts?: { tolerateNotFound?: boolean }): Promise<T> {
+    const { status, text, parsed } = await this.fetchEnvelope<T>(method, path, body, opts);
+    // A tolerated 404 (JSON or otherwise) means "already absent": success.
+    if (status === 404 && opts?.tolerateNotFound) {
+      return undefined as T;
+    }
+    this.throwOnError(method, path, status, text, parsed);
+    return parsed.result as T;
+  }
+
+  /**
+   * Raw envelope fetch shared by `request` and the paginated listers. The v4
+   * envelope carries pagination in `result_info` (sibling of `result`, not
+   * inside it), so callers that page need the whole envelope.
+   */
+  private async fetchEnvelope<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { tolerateNotFound?: boolean },
+  ): Promise<{
+    status: number;
+    text: string;
+    parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: T; result_info?: { cursor?: string } };
+  }> {
     const init: RequestInit = {
       method,
       headers: {
@@ -46,38 +70,116 @@ export class CfClient {
     };
     const res = await this.fetchImpl(`${CF_API}${path}`, init);
     const text = await res.text();
-    let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: T } = {};
+    let parsed: {
+      success?: boolean;
+      errors?: Array<{ message?: string }>;
+      result?: T;
+      result_info?: { cursor?: string };
+    } = {};
     try {
       parsed = text ? (JSON.parse(text) as typeof parsed) : {};
     } catch {
+      // A 404 with an HTML body still means "absent" on tolerant deletes;
+      // without this, teardown keeps the state record and retries forever.
+      if (opts?.tolerateNotFound && res.status === 404) {
+        return { status: res.status, text, parsed: {} };
+      }
       throw new CfError(res.status, text.slice(0, 500), `Cloudflare ${method} ${path}: non-JSON response ${res.status}`);
     }
-    if (!res.ok || parsed.success === false) {
-      const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
-      throw new CfError(res.status, text.slice(0, 500), `Cloudflare ${method} ${path} failed: ${res.status}${detail ? ` ${detail}` : ""}`);
-    }
-    return parsed.result as T;
+    return { status: res.status, text, parsed };
+  }
+
+  /** Throw unless the envelope is a successful 2xx response. */
+  private throwOnError(
+    method: string,
+    path: string,
+    status: number,
+    text: string,
+    parsed: { success?: boolean; errors?: Array<{ message?: string }> },
+  ): void {
+    // Teardown must be idempotent: a token that already expired (or was
+    // already revoked) and an already-deleted resource both return 404 on
+    // retry. Callers that tolerate it return early above, so reaching here
+    // with a 404 or a non-2xx is a real failure.
+    if (status >= 200 && status < 300 && parsed.success !== false) return;
+    const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
+    throw new CfError(status, text.slice(0, 500), `Cloudflare ${method} ${path} failed: ${status}${detail ? ` ${detail}` : ""}`);
   }
 
   // -- Workers ----------------------------------------------------------
 
-  /** Upload a stub script. Returns the Worker id used for per-Worker scoping. */
+  /**
+   * Upload a stub script. The script-upload endpoint takes multipart/form-data
+   * (a `metadata` part plus the module), not JSON — a JSON body is rejected.
+   * Returns the Worker id the per-Worker role is keyed on. (The classic script
+   * API returns the script name as `id` plus a separate `tag`; provision uses
+   * the returned `id` for scoping and the canary confirms it against the real
+   * API.)
+   */
   async createWorkerScript(name: string): Promise<{ id: string }> {
     const stub = `export default { async fetch() { return new Response("pct stub", { status: 200 }); } };`;
-    return this.request<{ id: string }>("PUT", `/accounts/${this.accountId}/workers/scripts/${name}`, {
-      script: stub,
-      bindings: [],
+    const form = new FormData();
+    form.set(
+      "metadata",
+      new Blob([JSON.stringify({ main_module: "worker.js", bindings: [] })], {
+        type: "application/json",
+      }),
+    );
+    form.set("worker.js", new Blob([stub], { type: "application/javascript+module" }), "worker.js");
+    const res = await this.fetchImpl(`${CF_API}/accounts/${this.accountId}/workers/scripts/${name}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${this.apiToken}` },
+      body: form,
     });
+    const text = await res.text();
+    let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: { id: string } } = {};
+    try {
+      parsed = text ? (JSON.parse(text) as typeof parsed) : {};
+    } catch {
+      throw new CfError(res.status, text.slice(0, 500), `Cloudflare PUT workers/scripts/${name}: non-JSON response ${res.status}`);
+    }
+    if (!res.ok || parsed.success === false) {
+      const detail = (parsed.errors ?? []).map((e) => e.message ?? "").filter(Boolean).join("; ");
+      throw new CfError(
+        res.status,
+        text.slice(0, 500),
+        `Cloudflare PUT workers/scripts/${name} failed: ${res.status}${detail ? ` ${detail}` : ""}`,
+      );
+    }
+    return parsed.result as { id: string };
   }
 
   async deleteWorkerScript(name: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/workers/scripts/${name}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/workers/scripts/${name}`, undefined, {
+      tolerateNotFound: true,
+    });
+  }
+
+  /**
+   * Check whether a script exists. Uses the settings sub-resource (JSON) rather
+   * than fetching the script itself: on a script that exists the content
+   * endpoint returns the script body, which is not JSON and would throw.
+   * Returns null when the script doesn't exist (404), so provision can fail
+   * closed instead of silently overwriting a pre-existing Worker with a PUT.
+   */
+  async getWorkerScript(name: string): Promise<{ id: string } | null> {
+    try {
+      return await this.request<{ id: string }>(
+        "GET",
+        `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(name)}/settings`,
+      );
+    } catch (err) {
+      if (err instanceof CfError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   // -- API tokens ---------------------------------------------------------
 
   async getPermissionGroups(): Promise<PermissionGroup[]> {
-    return this.request<PermissionGroup[]>("GET", "/user/tokens/permission_groups");
+    // The minting credential is account-owned, so permission groups resolve
+    // under the account — not under /user, which belongs to user tokens.
+    return this.request<PermissionGroup[]>("GET", `/accounts/${this.accountId}/tokens/permission_groups`);
   }
 
   async resolvePermissionGroupId(name: string, overrideId: string): Promise<string> {
@@ -98,8 +200,15 @@ export class CfClient {
     );
   }
 
+  /** Read back a minted token so provision can verify it matches the request. */
+  async getAccountToken(tokenId: string): Promise<unknown> {
+    return this.request<unknown>("GET", `/accounts/${this.accountId}/tokens/${tokenId}`);
+  }
+
   async revokeAccountToken(tokenId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/tokens/${tokenId}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/tokens/${tokenId}`, undefined, {
+      tolerateNotFound: true,
+    });
   }
 
   // -- D1 -----------------------------------------------------------------
@@ -109,7 +218,9 @@ export class CfClient {
   }
 
   async deleteD1(databaseId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/d1/database/${databaseId}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/d1/database/${databaseId}`, undefined, {
+      tolerateNotFound: true,
+    });
   }
 
   async d1Query(databaseId: string, sql: string, params?: unknown[]): Promise<unknown> {
@@ -127,29 +238,109 @@ export class CfClient {
   }
 
   async deleteNamespace(namespaceId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/storage/kv/namespaces/${namespaceId}`);
+    await this.request<unknown>(
+      "DELETE",
+      `/accounts/${this.accountId}/storage/kv/namespaces/${namespaceId}`,
+      undefined,
+      { tolerateNotFound: true },
+    );
   }
 
   // -- R2 -----------------------------------------------------------------
 
+  /**
+   * Create a bucket. Creation is `POST /r2/buckets` with `{name}` — a POST for
+   * an existing bucket conflicts, which backs up the pre-create existence
+   * check in provision.
+   */
   async createBucket(name: string): Promise<void> {
-    await this.request<unknown>("PUT", `/accounts/${this.accountId}/r2/buckets/${name}`);
+    await this.request<unknown>("POST", `/accounts/${this.accountId}/r2/buckets`, { name });
   }
 
-  async listBucketObjects(bucket: string): Promise<Array<{ key: string }>> {
-    const result = await this.request<{ objects?: Array<{ key: string }> }>(
-      "GET",
-      `/accounts/${this.accountId}/r2/buckets/${bucket}/objects?limit=1000`,
+  /**
+   * One page of bucket objects. The cursor returned here feeds the next
+   * call; `truncated` false means the bucket is fully listed.
+   */
+  async listBucketObjects(
+    bucket: string,
+    cursor?: string,
+  ): Promise<{ objects: Array<{ key: string }>; truncated: boolean; cursor?: string }> {
+    const params = new URLSearchParams({ limit: "1000" });
+    if (cursor) params.set("cursor", cursor);
+    const result = await this.request<{
+      objects?: Array<{ key: string }>;
+      truncated?: boolean;
+      cursor?: string;
+    }>("GET", `/accounts/${this.accountId}/r2/buckets/${bucket}/objects?${params.toString()}`);
+    return { objects: result.objects ?? [], truncated: result.truncated ?? false, cursor: result.cursor };
+  }
+
+  /**
+   * Delete a single object. Per-object delete is used because the bulk
+   * `DELETE .../objects` with a `{keys}` body could not be confirmed in the
+   * v4 API; deleting per key is slower but definitely exists.
+   *
+   * Each `/` stays a literal path separator (the Delete Object reference
+   * requires `object_key` slashes unencoded — `%2F` addresses a different,
+   * missing object, whose 404-tolerant delete would silently leave the real
+   * object behind and wedge the bucket non-empty). Every other reserved
+   * character is encoded within its segment; `.`/`..` segments are escaped so
+   * URL parsing cannot normalise them away before the request is sent.
+   */
+  async deleteBucketObject(bucket: string, key: string): Promise<void> {
+    const encodedKey = key
+      .split("/")
+      .map((segment) =>
+        segment === "." ? "%2E" : segment === ".." ? "%2E%2E" : encodeURIComponent(segment),
+      )
+      .join("/");
+    await this.request<unknown>(
+      "DELETE",
+      `/accounts/${this.accountId}/r2/buckets/${bucket}/objects/${encodedKey}`,
+      undefined,
+      { tolerateNotFound: true },
     );
-    return result.objects ?? [];
   }
 
-  async deleteBucketObjects(bucket: string, keys: string[]): Promise<void> {
-    if (keys.length === 0) return;
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${bucket}/objects`, { keys });
+  /**
+   * Names of all R2 buckets in the account. Used as an existence check before
+   * creating an env bucket, so provision never adopts (and later empties and
+   * deletes) a foreign bucket that happens to share the generated name. The
+   * account already holds more buckets than one page, so every page is
+   * followed (`per_page=1000` + cursor) — a single page could miss a name and
+   * let provision adopt a foreign bucket.
+   *
+   * Any non-empty cursor means another page, whether or not the response sets
+   * `truncated`: the v4 list-buckets response can return a cursor without it.
+   * Pagination also lives in the envelope's `result_info.cursor`, not inside
+   * `result`, so both locations are read.
+   */
+  async listBuckets(): Promise<string[]> {
+    const names: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const params = new URLSearchParams({ per_page: "1000" });
+      if (cursor) params.set("cursor", cursor);
+      const { status, text, parsed } = await this.fetchEnvelope<{
+        buckets?: Array<{ name: string }>;
+        truncated?: boolean;
+        cursor?: string;
+      }>("GET", `/accounts/${this.accountId}/r2/buckets?${params.toString()}`);
+      this.throwOnError("GET", `/accounts/${this.accountId}/r2/buckets`, status, text, parsed);
+      const result = parsed.result ?? {};
+      for (const b of result.buckets ?? []) {
+        if (typeof b.name === "string") names.push(b.name);
+      }
+      const next = result.cursor || parsed.result_info?.cursor;
+      if (!next) break;
+      cursor = next;
+    }
+    return names;
   }
 
   async deleteBucket(name: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${name}`);
+    await this.request<unknown>("DELETE", `/accounts/${this.accountId}/r2/buckets/${name}`, undefined, {
+      tolerateNotFound: true,
+    });
   }
 }

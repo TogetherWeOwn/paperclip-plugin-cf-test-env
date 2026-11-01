@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { checkProvisionAllowed, resolveConfig, DEFAULT_MAX_TTL_SECONDS } from "./config.js";
+import {
+  checkProvisionAllowed,
+  isValidNamePrefix,
+  resolveConfig,
+  DEFAULT_MAX_TTL_SECONDS,
+} from "./config.js";
 
 const base = {
   tokenSecretRef: { type: "secret_ref", secretId: "s-1" },
   accountId: "acct-1",
   allowedProjectIds: ["proj-kofra"],
   egressCidr: "203.0.113.0/24",
+  workerAdminGroupId: "grp-worker-admin",
+  r2ItemWriteGroupId: "grp-r2-item-write",
 };
 
 describe("resolveConfig", () => {
@@ -18,6 +25,20 @@ describe("resolveConfig", () => {
 
   it("treats a legacy string secret as unconfigured", () => {
     expect(resolveConfig({ ...base, tokenSecretRef: "s-1" }).tokenSecretRef).toBeNull();
+  });
+
+  it("clamps an oversized maxTtlSeconds to 3 h", () => {
+    expect(resolveConfig({ ...base, maxTtlSeconds: 99999 }).maxTtlSeconds).toBe(10800);
+    expect(resolveConfig({ ...base, maxTtlSeconds: 3600 }).maxTtlSeconds).toBe(3600);
+  });
+
+  it("validates name prefixes", () => {
+    expect(isValidNamePrefix("pct-")).toBe(true);
+    expect(isValidNamePrefix("t-")).toBe(false);
+    expect(isValidNamePrefix("PCT-")).toBe(false);
+    expect(isValidNamePrefix("pct")).toBe(false);
+    expect(isValidNamePrefix("prod-app-")).toBe(false);
+    expect(isValidNamePrefix("")).toBe(false);
   });
 });
 
@@ -38,5 +59,28 @@ describe("checkProvisionAllowed", () => {
 
   it("allows an allow-listed project under the cap", () => {
     expect(checkProvisionAllowed(resolveConfig(base), { projectId: "proj-kofra", liveCount: 9 })).toBeNull();
+  });
+
+  it("fails closed without permission-group ids or with a bad prefix", () => {
+    const full = {
+      ...base,
+      workerAdminGroupId: "grp-worker-admin",
+      r2ItemWriteGroupId: "grp-r2-item-write",
+    };
+    expect(
+      checkProvisionAllowed(resolveConfig({ ...base, workerAdminGroupId: "", r2ItemWriteGroupId: "" }), {
+        projectId: "proj-kofra",
+        liveCount: 0,
+      })?.code,
+    ).toBe("not_configured");
+    expect(
+      checkProvisionAllowed(resolveConfig({ ...full, namePrefix: "prod-app-" }), {
+        projectId: "proj-kofra",
+        liveCount: 0,
+      })?.code,
+    ).toBe("bad_prefix");
+    expect(
+      checkProvisionAllowed(resolveConfig(full), { projectId: "proj-kofra", liveCount: 0 }),
+    ).toBeNull();
   });
 });

@@ -10,12 +10,17 @@
  * get account-wide D1/KV write: D1 goes through the `d1_execute` tool, which
  * the worker pins to the env's database id.
  *
- * CANARY NOTE: the exact Cloudflare resource-identifier strings below
- * (`com.cloudflare.edge.worker.script` nested `accountId/workerId`, and the
- * R2 bucket resource) encode the operator's 2026-11-01 research. The merge
- * gate requires the operator to verify a minted token against the real API
- * (deploy/secret/delete on the stub Worker, 403 on production); if the API
- * shape differs, change ONLY the builders in this file.
+ * CANARY NOTE: the exact Cloudflare resource-identifier strings below follow
+ * the documented R2 shape (`com.cloudflare.edge.r2.bucket.<ACCOUNT>_<BUCKET>`
+ * with value `"*"`, developers.cloudflare.com/r2/api/tokens, "Access Policy →
+ * Bucket"). The per-Worker key is inferred by analogy
+ * (`com.cloudflare.edge.worker.script.<WORKER_ID>` with value `"*"`) because
+ * the Workers authorization docs don't publish the single-Worker key; confirm
+ * it by reading the policy of a dashboard-made per-Worker token via
+ * `GET /accounts/{id}/tokens/{tokenId}`. The merge gate requires the operator
+ * to verify a minted token against the real API (deploy/secret/delete on the
+ * stub Worker, 403 on production); if the API shape differs, change ONLY the
+ * builders in this file.
  */
 
 export const WORKER_SCRIPT_RESOURCE = "com.cloudflare.edge.worker.script";
@@ -36,7 +41,10 @@ export interface TokenRequest {
   policies: TokenPolicy[];
   expires_on: string;
   not_before: string;
-  condition: { request_ip: { in: string[] } };
+  /** Dotted key is what Cloudflare documents (`"request.ip"`); `request_ip`
+   * with an underscore is silently ignored, which would mint an unfiltered
+   * token. */
+  condition: { "request.ip": { in: string[] } };
 }
 
 /** Worker names are lowercase alphanumerics and dashes (Cloudflare script-name rule). */
@@ -61,14 +69,23 @@ export function workerNameFor(prefix: string, issueId: string, randHex: string):
   return name;
 }
 
-/** `accountId/workerId` nesting: the per-Worker role applies to this Worker only. */
+/**
+ * Per-Worker resource: `<type>.<workerId>` with value `"*"`, mirroring the
+ * documented R2 shape. The per-Worker allowance applies to this Worker only.
+ * `accountId` is kept so the key can be re-nested under
+ * `com.cloudflare.api.account.<id>` if the canary shows Cloudflare requires it.
+ */
 export function workerResource(accountId: string, workerId: string): Record<string, string> {
-  return { [WORKER_SCRIPT_RESOURCE]: `${accountId}/${workerId}` };
+  void accountId;
+  return { [`${WORKER_SCRIPT_RESOURCE}.${workerId}`]: "*" };
 }
 
-/** `accountId/bucketName` nesting: Item Write applies to this bucket only. */
+/**
+ * Documented R2 shape: `com.cloudflare.edge.r2.bucket.<ACCOUNT>_default_<BUCKET>`
+ * with value `"*"`. Item Write applies to this bucket only.
+ */
 export function r2BucketResource(accountId: string, bucketName: string): Record<string, string> {
-  return { [R2_BUCKET_RESOURCE]: `${accountId}/${bucketName}` };
+  return { [`${R2_BUCKET_RESOURCE}.${accountId}_default_${bucketName}`]: "*" };
 }
 
 export function buildTokenPolicies(opts: {
@@ -92,6 +109,15 @@ export function buildTokenPolicies(opts: {
   ];
 }
 
+/**
+ * Cloudflare documents `expires_on`/`not_before` as `"2018-07-01T05:20:00Z"`
+ * with no milliseconds. `toISOString()` produces `.000Z`; strip the fraction
+ * so the API can never read the timestamp in a lenient or odd way.
+ */
+export function toCloudflareTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 export function buildTokenRequest(opts: {
   name: string;
   policies: TokenPolicy[];
@@ -111,10 +137,87 @@ export function buildTokenRequest(opts: {
   return {
     name: opts.name,
     policies: opts.policies,
-    not_before: new Date(opts.nowMs).toISOString(),
-    expires_on: new Date(opts.nowMs + opts.ttlSeconds * 1000).toISOString(),
-    condition: { request_ip: { in: [opts.egressCidr] } },
+    not_before: toCloudflareTimestamp(opts.nowMs),
+    expires_on: toCloudflareTimestamp(opts.nowMs + opts.ttlSeconds * 1000),
+    condition: { "request.ip": { in: [opts.egressCidr] } },
   };
+}
+
+/**
+ * Verify the token the API actually minted, right after creation. A wrong
+ * request shape can pass every unit test and still produce a weaker token
+ * (e.g. an ignored condition key), so provision fails closed unless the stored
+ * token shows: the exact egress CIDR under `"request.ip"`, an expiry no later
+ * than requested, and exactly the two policies built above — compared whole,
+ * not just by resource key. A key-only check would pass a token whose stored
+ * policy kept the key but widened the value (e.g. a nested
+ * `com.cloudflare.api.account.<id>: "*"` covering the whole account) or
+ * swapped in a broader permission group. Throws on any mismatch; the caller
+ * revokes and rolls back.
+ */
+export function assertMintedTokenMatches(
+  actual: unknown,
+  expected: { policies: TokenPolicy[]; expiresOn: string; egressCidr: string },
+): void {
+  const fail = (detail: string): never => {
+    throw new Error(`minted token failed verification (${detail}); refusing to hand it out`);
+  };
+  const rec = (actual ?? {}) as Record<string, unknown>;
+  const condition = (rec.condition ?? {}) as Record<string, unknown>;
+  const reqIp = (condition["request.ip"] ?? {}) as Record<string, unknown>;
+  const within = Array.isArray(reqIp.in) ? reqIp.in : [];
+  if (within.length !== 1 || within[0] !== expected.egressCidr) {
+    fail("IP condition is not exactly the requested egress CIDR");
+  }
+  const expiresOn = rec.expires_on;
+  if (
+    typeof expiresOn !== "string" ||
+    Number.isNaN(Date.parse(expiresOn)) ||
+    Date.parse(expiresOn) > Date.parse(expected.expiresOn)
+  ) {
+    fail("expiry is missing, unparsable, or later than requested");
+  }
+  const policies = rec.policies;
+  if (!Array.isArray(policies) || policies.length !== 2) {
+    fail(`expected exactly 2 policies, saw ${Array.isArray(policies) ? policies.length : typeof policies}`);
+  }
+  // Whole-policy comparison: effect, the FULL resources object (keys and
+  // nested values), and the sorted permission-group ids. Order-independent
+  // across the policy list, exact within each policy.
+  const normalised = (policies as unknown[]).map(normalisePolicy).map((p) => JSON.stringify(p)).sort();
+  const wanted = expected.policies.map(normalisePolicy).map((p) => JSON.stringify(p)).sort();
+  if (JSON.stringify(normalised) !== JSON.stringify(wanted)) {
+    fail("stored token policies differ from those requested");
+  }
+}
+
+/** Canonical form of one token policy for exact comparison. */
+function normalisePolicy(p: unknown): { effect: string; resources: unknown; groupIds: string[] } {
+  const rec = (p ?? {}) as Record<string, unknown>;
+  const groups = rec.permission_groups;
+  const groupIds = Array.isArray(groups)
+    ? groups
+        .map((g) => (g as { id?: unknown } | null)?.id)
+        .filter((id): id is string => typeof id === "string")
+        .sort()
+    : [];
+  return {
+    effect: typeof rec.effect === "string" ? rec.effect : "",
+    resources: canonicalValue(rec.resources ?? {}),
+    groupIds,
+  };
+}
+
+/** Recursively sort object keys so structurally-equal values stringify equally. */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    return Object.fromEntries(entries.map(([k, v]) => [k, canonicalValue(v)]));
+  }
+  return value;
 }
 
 /** Clamp the requested TTL to the configured max; reject non-positive values. */

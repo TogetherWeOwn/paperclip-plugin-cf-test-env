@@ -1,13 +1,13 @@
+import { randomBytes } from "node:crypto";
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { CfClient, type FetchImpl } from "./cloudflare.js";
 import { checkProvisionAllowed, type CfTestEnvConfig } from "./config.js";
 import { ENV_DOC_KEY } from "./manifest.js";
 import {
+  assertMintedTokenMatches,
   buildTokenPolicies,
   buildTokenRequest,
   clampTtl,
-  R2_ITEM_WRITE_GROUP_NAME,
-  WORKER_ADMIN_GROUP_NAME,
   workerNameFor,
 } from "./scoping.js";
 
@@ -16,6 +16,12 @@ export interface EnvRecord {
   issueId: string;
   companyId: string;
   projectId: string;
+  /**
+   * Agent that provisioned the env; only it may use or tear it down.
+   * Optional: records written before 0.1.1 lack it and fall back to the
+   * current-assignee + allow-list checks in authorizeEnvCaller.
+   */
+  ownerAgentId?: string;
   workerName: string;
   workerId: string;
   d1Id: string;
@@ -25,8 +31,37 @@ export interface EnvRecord {
   /** ISO expiry of the minted token. */
   expiresAt: string;
   createdAt: string;
-  status: "live" | "torn_down";
+  status: "live";
 }
+
+/**
+ * Written BEFORE the first Cloudflare call and updated as each resource is
+ * created, so a partial provision (crash or failure mid-way) is visible to
+ * the sweeper instead of leaking untracked resources — possibly including a
+ * live, unrecorded token. Resource ids stay optional until their step
+ * succeeds.
+ */
+export interface ProvisioningRecord {
+  envId: string;
+  issueId: string;
+  companyId: string;
+  projectId: string;
+  ownerAgentId?: string;
+  workerName: string;
+  workerId?: string;
+  d1Id?: string;
+  kvId?: string;
+  r2Bucket?: string;
+  tokenId?: string;
+  expiresAt?: string;
+  createdAt: string;
+  status: "provisioning";
+}
+
+export type AnyEnvRecord = EnvRecord | ProvisioningRecord;
+
+/** Provisioning records older than this are stale and swept. */
+export const PROVISIONING_STALE_MS = 30 * 60 * 1000;
 
 export interface ProvisionResult {
   envId: string;
@@ -53,21 +88,80 @@ async function writeIndex(ctx: PluginContext, companyId: string, ids: string[]):
   await ctx.state.set(indexKey(companyId), ids);
 }
 
+/**
+ * Promise-chain mutex per company for the env index. Two provisions (or a
+ * provision racing the hourly sweep or a teardown) that each do
+ * read-modify-write can otherwise drop an envId from the index; the sweep and
+ * `issue.updated` only walk the index, so that env's Worker, D1, KV and R2
+ * would leak with no record, and the concurrency cap would undercount. Every
+ * index change goes through `addToIndex`/`removeFromIndex` — an add or remove
+ * inside the lock, never a write-back of a stale copy.
+ */
+const indexLocks = new Map<string, Promise<void>>();
+
+async function withIndexLock<T>(companyId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = indexLocks.get(companyId) ?? Promise.resolve();
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Compare against the stored tail, not `turn`: the map holds
+  // `prev.then(() => turn)` (a different promise object), so comparing with
+  // `turn` never matched and idle company entries leaked forever.
+  const tail = prev.then(() => turn);
+  indexLocks.set(companyId, tail);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (indexLocks.get(companyId) === tail) indexLocks.delete(companyId);
+  }
+}
+
+async function addToIndex(ctx: PluginContext, companyId: string, envId: string): Promise<void> {
+  await withIndexLock(companyId, async () => {
+    const ids = await readIndex(ctx, companyId);
+    if (!ids.includes(envId)) {
+      await writeIndex(ctx, companyId, [...ids, envId]);
+    }
+  });
+}
+
+async function removeFromIndex(ctx: PluginContext, companyId: string, envId: string): Promise<void> {
+  await withIndexLock(companyId, async () => {
+    const ids = await readIndex(ctx, companyId);
+    if (ids.includes(envId)) {
+      await writeIndex(ctx, companyId, ids.filter((id) => id !== envId));
+    }
+  });
+}
+
 export async function readEnv(ctx: PluginContext, companyId: string, envId: string): Promise<EnvRecord | null> {
+  const raw = await readAnyEnv(ctx, companyId, envId);
+  if (!raw || raw.status !== "live") return null;
+  return raw;
+}
+
+async function readAnyEnv(
+  ctx: PluginContext,
+  companyId: string,
+  envId: string,
+): Promise<AnyEnvRecord | null> {
   if (!isSafeId(envId)) return null;
-  const raw = (await ctx.state.get(envKey(companyId, envId))) as EnvRecord | null;
-  if (!raw || typeof raw !== "object" || raw.status !== "live") return null;
+  const raw = (await ctx.state.get(envKey(companyId, envId))) as AnyEnvRecord | null;
+  if (!raw || typeof raw !== "object" || (raw.status !== "live" && raw.status !== "provisioning")) {
+    return null;
+  }
   return raw;
 }
 
 const isSafeId = (id: string): boolean => /^[A-Za-z0-9_-]{1,128}$/.test(id);
 
 export function randomHex(bytes: number): string {
-  const chars: string[] = [];
-  for (let i = 0; i < bytes; i++) {
-    chars.push(Math.floor(Math.random() * 256).toString(16).padStart(2, "0"));
-  }
-  return chars.join("");
+  // Unpredictable suffixes: Math.random has ~24 bits of state and repeats
+  // across runs, so it must not feed resource names.
+  return randomBytes(bytes).toString("hex");
 }
 
 export interface ProvisionDeps {
@@ -79,9 +173,12 @@ export interface ProvisionDeps {
 
 /**
  * Provision a disposable test env for the caller's card.
- * Fail-closed: every check runs before the first Cloudflare call, and the
- * minted token value is returned to the agent only — never written to state,
- * documents, or logs.
+ * Fail-closed: every check runs before the first Cloudflare call, a
+ * `provisioning` record is written before the first Cloudflare call and
+ * updated as each resource is created (so a partial provision rolls back
+ * instead of leaking), and the minted token value is returned to the agent
+ * only — never written to plugin state or issue documents (it does appear in
+ * the run transcript, bounded by its TTL and IP filter).
  */
 export async function provision(
   ctx: PluginContext,
@@ -98,9 +195,16 @@ export async function provision(
   if (issue.assigneeAgentId !== run.agentId) {
     throw new Error("Only the agent assigned to the issue may provision its test env.");
   }
-  const projectId = (issue as { projectId?: string }).projectId ?? run.projectId;
-  const live = await liveEnvs(ctx, run.companyId);
-  const gate = checkProvisionAllowed(config, { projectId, liveCount: live.length });
+  // No fallback to the run's project: a card with no project must not borrow
+  // the run's allow-listed project. Fail closed.
+  const projectId = (issue as { projectId?: string }).projectId;
+  if (!projectId) {
+    throw new Error("Issue has no project; cannot provision a test env.");
+  }
+  // Count every tracked env (live plus in-progress provisioning) so repeated
+  // failed provisions can't bypass the concurrency cap.
+  const tracked = await allEnvs(ctx, run.companyId);
+  const gate = checkProvisionAllowed(config, { projectId, liveCount: tracked.length });
   if (gate) throw new Error(gate.message);
   const ttl = clampTtl(input.ttlSeconds, config.maxTtlSeconds);
 
@@ -113,76 +217,202 @@ export async function provision(
   const workerName = workerNameFor(config.namePrefix, input.issueId, rand);
   const envId = `${workerName}`;
 
-  // Create resources first: the per-Worker token needs the Worker id.
-  const worker = await cf.createWorkerScript(workerName);
-  const d1 = await cf.createD1(workerName);
-  const kv = await cf.createNamespace(workerName);
-  await cf.createBucket(workerName);
-
-  const workerAdminGroupId = await cf.resolvePermissionGroupId(
-    WORKER_ADMIN_GROUP_NAME,
-    config.workerAdminGroupId,
-  );
-  const r2ItemWriteGroupId = await cf.resolvePermissionGroupId(
-    R2_ITEM_WRITE_GROUP_NAME,
-    config.r2ItemWriteGroupId,
-  );
-  const policies = buildTokenPolicies({
-    accountId: config.accountId,
-    workerId: worker.id,
-    bucketName: workerName,
-    workerAdminGroupId,
-    r2ItemWriteGroupId,
-  });
-  const tokenReq = buildTokenRequest({
-    name: `${workerName}-token`,
-    policies,
-    nowMs,
-    ttlSeconds: ttl,
-    egressCidr: config.egressCidr,
-  });
-  const token = await cf.createAccountToken(tokenReq);
-
-  const record: EnvRecord = {
+  // Provisioning record first: any failure below rolls back against this, and
+  // the sweep retries whatever rollback couldn't finish.
+  const progress: ProvisioningRecord = {
     envId,
     issueId: input.issueId,
     companyId: run.companyId,
     projectId,
+    ownerAgentId: run.agentId,
     workerName,
-    workerId: worker.id,
-    d1Id: d1.uuid,
-    kvId: kv.id,
-    r2Bucket: workerName,
-    tokenId: token.id,
-    expiresAt: tokenReq.expires_on,
     createdAt: new Date(nowMs).toISOString(),
-    status: "live",
+    status: "provisioning",
   };
-  await ctx.state.set(envKey(run.companyId, envId), record);
-  await writeIndex(ctx, run.companyId, [...(await readIndex(ctx, run.companyId)), envId]);
+  const saveProgress = async (): Promise<void> => {
+    await ctx.state.set(envKey(run.companyId, envId), { ...progress });
+  };
+  await saveProgress();
+  await addToIndex(ctx, run.companyId, envId);
 
-  // Non-secret record on the card: names and expiry only, never the token.
-  await ctx.issues.documents.upsert({
-    issueId: input.issueId,
-    key: ENV_DOC_KEY,
-    companyId: run.companyId,
-    title: "Cloudflare test env",
-    format: "markdown",
-    body: [
-      `# Cloudflare test env \`${workerName}\``,
-      ``,
-      `- worker: \`${workerName}\``,
-      `- account: \`${config.accountId}\``,
-      `- expires: \`${record.expiresAt}\``,
-      `- d1: \`${d1.uuid}\` (via the \`d1_execute\` tool only)`,
-      `- kv: \`${kv.id}\``,
-      `- r2: \`${workerName}\``,
-      ``,
-      `Never use the root wrangler.jsonc.`,
-    ].join("\n"),
-  });
+  try {
+    // Never overwrite a pre-existing Worker: the minted token would otherwise
+    // get Admin over somebody else's script.
+    const existing = await cf.getWorkerScript(workerName);
+    if (existing) {
+      throw new Error(`Worker ${workerName} already exists; refusing to overwrite it.`);
+    }
+    // Same for the R2 bucket: adopting a foreign bucket would let rollback
+    // or teardown empty and delete somebody else's data.
+    if ((await cf.listBuckets()).includes(workerName)) {
+      throw new Error(`R2 bucket ${workerName} already exists; refusing to adopt it.`);
+    }
+    // Create resources first: the per-Worker token needs the Worker id.
+    const worker = await cf.createWorkerScript(workerName);
+    progress.workerId = worker.id;
+    await saveProgress();
+    const d1 = await cf.createD1(workerName);
+    progress.d1Id = d1.uuid;
+    await saveProgress();
+    const kv = await cf.createNamespace(workerName);
+    progress.kvId = kv.id;
+    await saveProgress();
+    await cf.createBucket(workerName);
+    progress.r2Bucket = workerName;
+    await saveProgress();
 
-  return { envId, workerName, accountId: config.accountId, expiresAt: record.expiresAt, token: token.value };
+    // Permission-group ids are required config (fail-closed in the gate
+    // above): no runtime lookup by display name.
+    const policies = buildTokenPolicies({
+      accountId: config.accountId,
+      workerId: worker.id,
+      bucketName: workerName,
+      workerAdminGroupId: config.workerAdminGroupId,
+      r2ItemWriteGroupId: config.r2ItemWriteGroupId,
+    });
+    const tokenReq = buildTokenRequest({
+      name: `${workerName}-token`,
+      policies,
+      nowMs,
+      ttlSeconds: ttl,
+      egressCidr: config.egressCidr,
+    });
+    const token = await cf.createAccountToken(tokenReq);
+    progress.tokenId = token.id;
+    progress.expiresAt = tokenReq.expires_on;
+    await saveProgress();
+    // Fail closed on shape drift: verify the stored token carries the exact
+    // egress CIDR, an expiry no later than requested, exactly 2 policies, and
+    // exactly the resource keys built above. On mismatch the catch below
+    // revokes the token (progress.tokenId is set) and rolls everything back.
+    assertMintedTokenMatches(await cf.getAccountToken(token.id), {
+      policies,
+      expiresOn: tokenReq.expires_on,
+      egressCidr: config.egressCidr,
+    });
+
+    const record: EnvRecord = {
+      envId,
+      issueId: input.issueId,
+      companyId: run.companyId,
+      projectId,
+      ownerAgentId: run.agentId,
+      workerName,
+      workerId: worker.id,
+      d1Id: d1.uuid,
+      kvId: kv.id,
+      r2Bucket: workerName,
+      tokenId: token.id,
+      expiresAt: tokenReq.expires_on,
+      createdAt: progress.createdAt,
+      status: "live",
+    };
+    await ctx.state.set(envKey(run.companyId, envId), record);
+
+    // Non-secret record on the card: names and expiry only, never the token.
+    await ctx.issues.documents.upsert({
+      issueId: input.issueId,
+      key: ENV_DOC_KEY,
+      companyId: run.companyId,
+      title: "Cloudflare test env",
+      format: "markdown",
+      body: [
+        `# Cloudflare test env \`${workerName}\``,
+        ``,
+        `- worker: \`${workerName}\``,
+        `- account: \`${config.accountId}\``,
+        `- expires: \`${record.expiresAt}\``,
+        `- d1: \`${d1.uuid}\` (via the \`d1_execute\` tool only)`,
+        `- kv: \`${kv.id}\``,
+        `- r2: \`${workerName}\``,
+        ``,
+        `Never use the root wrangler.jsonc.`,
+      ].join("\n"),
+    });
+
+    return { envId, workerName, accountId: config.accountId, expiresAt: record.expiresAt, token: token.value };
+  } catch (err) {
+    // Roll back in teardown order — revoke the token first — then rethrow.
+    // When rollback is clean there is nothing for the sweep to do, so the
+    // provisioning record is dropped; otherwise it is kept for the sweep.
+    const rollbackErrors = await rollbackPartial(cf, progress);
+    if (rollbackErrors.length === 0) {
+      await ctx.state.delete(envKey(run.companyId, envId));
+      await removeFromIndex(ctx, run.companyId, envId);
+    } else {
+      await saveProgress();
+    }
+    const detail = rollbackErrors.length > 0 ? ` (rollback incomplete: ${rollbackErrors.join("; ")})` : "";
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`${message}${detail}`);
+  }
+}
+
+/**
+ * Best-effort rollback of a partial provision, in teardown order. Returns the
+ * step errors (empty when everything was undone).
+ */
+async function rollbackPartial(cf: CfClient, progress: ProvisioningRecord): Promise<string[]> {
+  const errors: string[] = [];
+  const attempt = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
+    try {
+      await fn();
+    } catch (err) {
+      errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  if (progress.tokenId) {
+    await attempt("revoke token", () => cf.revokeAccountToken(progress.tokenId!));
+  }
+  // Only delete a Worker this provision created (create returned an id).
+  // In particular, never delete the pre-existing Worker that trips the
+  // overwrite guard above. Residual risk: a PUT that succeeded remotely with
+  // a lost response leaks one untracked Worker — accepted over deleting
+  // foreign Workers.
+  if (progress.workerId) {
+    await attempt("delete worker", () => cf.deleteWorkerScript(progress.workerName));
+  }
+  if (progress.d1Id) {
+    await attempt("delete d1", () => cf.deleteD1(progress.d1Id!));
+  }
+  if (progress.kvId) {
+    await attempt("delete kv", () => cf.deleteNamespace(progress.kvId!));
+  }
+  if (progress.r2Bucket) {
+    await attempt("empty r2", () => emptyBucket(cf, progress.r2Bucket!));
+    await attempt("delete r2 bucket", () => cf.deleteBucket(progress.r2Bucket!));
+  }
+  return errors;
+}
+
+/**
+ * Same gate as provision: the caller must be the agent that provisioned the
+ * env (and still be the card's assignee), and the env's project must still be
+ * allow-listed. Without this, any agent in the company could run arbitrary
+ * SQL on another card's D1 (the envId is the Worker name, which the card
+ * document publishes) with the near-admin minting credential.
+ */
+export async function authorizeEnvCaller(
+  ctx: PluginContext,
+  config: CfTestEnvConfig,
+  run: { agentId: string; companyId: string },
+  env: AnyEnvRecord,
+): Promise<void> {
+  // Records written before 0.1.1 have no ownerAgentId; they fall back to the
+  // current-assignee + allow-list checks below.
+  if (env.ownerAgentId && run.agentId !== env.ownerAgentId) {
+    throw new Error("Only the agent that provisioned this test env may use it.");
+  }
+  const issue = await ctx.issues.get(env.issueId, run.companyId);
+  if (!issue || (issue as { assigneeAgentId?: string }).assigneeAgentId !== run.agentId) {
+    throw new Error("Only the agent assigned to the issue may use its test env.");
+  }
+  // The card's CURRENT project must be allow-listed: moving the card to a
+  // disallowed project revokes D1/teardown access instead of grandfathering it.
+  const currentProjectId = (issue as { projectId?: string }).projectId;
+  if (!currentProjectId || !config.allowedProjectIds.includes(currentProjectId)) {
+    throw new Error("This project is not allow-listed for cf-test-env.");
+  }
 }
 
 /** Run SQL only on the env's own D1. The env token cannot do this; the worker can. */
@@ -195,6 +425,7 @@ export async function d1Execute(
 ): Promise<unknown> {
   const env = await readEnv(ctx, run.companyId, input.envId);
   if (!env) throw new Error("Test env not found or already torn down.");
+  await authorizeEnvCaller(ctx, config, run, env);
   if (Date.parse(env.expiresAt) <= Date.now()) {
     throw new Error("Test env expired; provision a fresh one.");
   }
@@ -209,9 +440,43 @@ export async function d1Execute(
 }
 
 /**
+ * Empty an R2 bucket. Each round snapshots the full key listing (following
+ * cursors — a single 1000-object page is not enough) BEFORE deleting
+ * anything: deleting between pages shifts offset-based listings and would
+ * silently skip objects, and leftover objects block the bucket delete and
+ * wedge the env in state. Rounds repeat so objects added concurrently still
+ * converge; a bucket that never empties fails loudly and keeps state.
+ */
+export async function emptyBucket(cf: CfClient, bucket: string): Promise<void> {
+  for (let round = 0; round < 10; round++) {
+    const keys: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await cf.listBucketObjects(bucket, cursor);
+      keys.push(...page.objects.map((o) => o.key));
+      if (!page.truncated || !page.cursor) break;
+      cursor = page.cursor;
+    }
+    if (keys.length === 0) return;
+    for (const key of keys) {
+      await cf.deleteBucketObject(bucket, key);
+    }
+  }
+  throw new Error(`bucket ${bucket} still has objects after emptying; keeping state for retry`);
+}
+
+/**
  * Tear down an env: revoke the token FIRST (so a leaked token dies even if
  * resource deletion fails), then delete Worker, D1, KV and R2 (emptied
  * first), then drop state and update the card record.
+ *
+ * Handles both live envs and stale `provisioning` records (deleting only the
+ * resources the record shows as created). 404 on any DELETE counts as
+ * success, so retries can't wedge an env in state forever.
+ *
+ * When `run` is provided (an agent calling the `teardown` tool), the same
+ * gate as provision applies. System paths (sweep, issue.updated, provision
+ * rollback) omit it.
  */
 export async function teardown(
   ctx: PluginContext,
@@ -219,10 +484,14 @@ export async function teardown(
   companyId: string,
   envId: string,
   deps: { fetchImpl: FetchImpl; resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string> },
+  run?: { agentId: string },
 ): Promise<{ errors: string[] }> {
   const errors: string[] = [];
-  const raw = (await ctx.state.get(envKey(companyId, envId))) as EnvRecord | null;
-  if (!raw || raw.status !== "live") return { errors };
+  const raw = await readAnyEnv(ctx, companyId, envId);
+  if (!raw) return { errors };
+  if (run) {
+    await authorizeEnvCaller(ctx, config, { agentId: run.agentId, companyId }, raw);
+  }
   if (!config.tokenSecretRef || !config.accountId) {
     return { errors: ["cf-test-env is not configured; cannot tear down. State kept for retry."] };
   }
@@ -239,45 +508,61 @@ export async function teardown(
     }
   };
 
-  await attempt("revoke token", () => cf.revokeAccountToken(raw.tokenId));
-  await attempt("delete worker", () => cf.deleteWorkerScript(raw.workerName));
-  await attempt("delete d1", () => cf.deleteD1(raw.d1Id));
-  await attempt("delete kv", () => cf.deleteNamespace(raw.kvId));
-  await attempt("empty r2", async () => {
-    const objects = await cf.listBucketObjects(raw.r2Bucket);
-    await cf.deleteBucketObjects(raw.r2Bucket, objects.map((o) => o.key));
-  });
-  await attempt("delete r2 bucket", () => cf.deleteBucket(raw.r2Bucket));
+  if (raw.tokenId) {
+    await attempt("revoke token", () => cf.revokeAccountToken(raw.tokenId!));
+  }
+  // Live records always carry workerId; provisioning records only when this
+  // provision created the Worker — a swept pre-check record must never delete
+  // a foreign Worker that happens to share the name.
+  if (raw.status === "live" || raw.workerId) {
+    await attempt("delete worker", () => cf.deleteWorkerScript(raw.workerName));
+  }
+  if (raw.d1Id) {
+    const d1Id = raw.d1Id;
+    await attempt("delete d1", () => cf.deleteD1(d1Id));
+  }
+  if (raw.kvId) {
+    const kvId = raw.kvId;
+    await attempt("delete kv", () => cf.deleteNamespace(kvId));
+  }
+  if (raw.r2Bucket) {
+    const bucket = raw.r2Bucket;
+    await attempt("empty r2", () => emptyBucket(cf, bucket));
+    await attempt("delete r2 bucket", () => cf.deleteBucket(bucket));
+  }
 
   if (errors.length === 0) {
     await ctx.state.delete(envKey(companyId, envId));
-    await writeIndex(
-      ctx,
-      companyId,
-      (await readIndex(ctx, companyId)).filter((id) => id !== envId),
-    );
-    try {
-      await ctx.issues.documents.upsert({
-        issueId: raw.issueId,
-        key: ENV_DOC_KEY,
-        companyId,
-        title: "Cloudflare test env",
-        format: "markdown",
-        body: `# Cloudflare test env \`${raw.workerName}\`\n\nTorn down at ${new Date().toISOString()}.`,
-      });
-    } catch {
-      // Card bookkeeping must not fail the teardown.
+    await removeFromIndex(ctx, companyId, envId);
+    if (raw.status === "live") {
+      try {
+        await ctx.issues.documents.upsert({
+          issueId: raw.issueId,
+          key: ENV_DOC_KEY,
+          companyId,
+          title: "Cloudflare test env",
+          format: "markdown",
+          body: `# Cloudflare test env \`${raw.workerName}\`\n\nTorn down at ${new Date().toISOString()}.`,
+        });
+      } catch {
+        // Card bookkeeping must not fail the teardown.
+      }
     }
   }
   return { errors };
 }
 
 export async function liveEnvs(ctx: PluginContext, companyId: string): Promise<EnvRecord[]> {
+  return (await allEnvs(ctx, companyId)).filter((e): e is EnvRecord => e.status === "live");
+}
+
+/** Every tracked env: live plus in-progress provisioning. */
+export async function allEnvs(ctx: PluginContext, companyId: string): Promise<AnyEnvRecord[]> {
   const ids = await readIndex(ctx, companyId);
-  const out: EnvRecord[] = [];
+  const out: AnyEnvRecord[] = [];
   for (const id of ids) {
-    const env = (await ctx.state.get(envKey(companyId, id))) as EnvRecord | null;
-    if (env && env.status === "live") out.push(env);
+    const env = await readAnyEnv(ctx, companyId, id);
+    if (env) out.push(env);
   }
   return out;
 }
@@ -289,9 +574,11 @@ export interface SweepResult {
 }
 
 /**
- * Hourly sweep: tear down envs whose token expired, and envs whose owning
- * card is done/cancelled (or unreadable — orphaned). Only touches envs in
- * this plugin's state index, never arbitrary `pct-*` names.
+ * Hourly sweep: tear down live envs whose token expired, live envs whose
+ * owning card is done/cancelled (or unreadable — orphaned), and stale
+ * `provisioning` records left by a crashed or incompletely rolled-back
+ * provision. Only touches envs in this plugin's state index, never
+ * arbitrary `pct-*` names.
  */
 export async function sweep(
   ctx: PluginContext,
@@ -301,10 +588,14 @@ export async function sweep(
 ): Promise<SweepResult> {
   const nowMs = deps.nowMs ?? Date.now();
   const result: SweepResult = { checked: 0, tornDown: [], errors: [] };
-  for (const env of await liveEnvs(ctx, companyId)) {
+  for (const env of await allEnvs(ctx, companyId)) {
     result.checked += 1;
-    let stale = Date.parse(env.expiresAt) <= nowMs;
-    if (!stale) {
+    let stale: boolean;
+    if (env.status === "provisioning") {
+      stale = nowMs - Date.parse(env.createdAt) > PROVISIONING_STALE_MS;
+    } else if (Date.parse(env.expiresAt) <= nowMs) {
+      stale = true;
+    } else {
       try {
         const issue = await ctx.issues.get(env.issueId, companyId);
         const status = (issue as { status?: string } | null)?.status;
@@ -331,15 +622,26 @@ export async function handleIssueUpdated(
   companyId: string,
   issueId: string,
   status: string,
-  deps: { fetchImpl: FetchImpl; resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string> },
+  deps: {
+    fetchImpl: FetchImpl;
+    nowMs?: number;
+    resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string>;
+  },
 ): Promise<void> {
   if (status !== "done" && status !== "cancelled") return;
+  const nowMs = deps.nowMs ?? Date.now();
   // Only touch envs that reference this exact issue id — never name-prefix scans.
-  const ids = await readIndex(ctx, companyId);
-  for (const id of ids) {
-    const env = (await ctx.state.get(envKey(companyId, id))) as EnvRecord | null;
-    if (env && env.status === "live" && env.issueId === issueId) {
-      await teardown(ctx, config, companyId, id, deps);
+  for (const env of await allEnvs(ctx, companyId)) {
+    if (env.issueId !== issueId) continue;
+    // Never pull the index out from under a still-running provision: a
+    // `provisioning` record younger than the sweep's stale window is left for
+    // the sweep (which only tears down stale provisioning records). The
+    // just-closed card still loses its env — once the run finishes, the env is
+    // either rolled back or `live` on a closed card, and the next sweep tears
+    // it down. Nothing leaks; the token still expires within 3 h regardless.
+    if (env.status === "provisioning" && nowMs - Date.parse(env.createdAt) <= PROVISIONING_STALE_MS) {
+      continue;
     }
+    await teardown(ctx, config, companyId, env.envId, deps);
   }
 }

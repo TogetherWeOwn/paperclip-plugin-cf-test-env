@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.cf-test-env";
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.1.1";
 export const SWEEP_JOB_KEY = "cf-env-sweep";
 
 export const PROVISION_TOOL = "provision";
@@ -93,7 +93,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SWEEP_JOB_KEY,
       displayName: "Sweep expired Cloudflare test envs",
       description:
-        "Hourly: tear down pct-* envs whose token expired or whose owning card is done/cancelled, and delete orphaned pct-* resources.",
+        "Hourly: tear down tracked envs whose token expired, whose owning card is done/cancelled or unreadable, and stale in-progress provisions. Only touches envs recorded in this plugin's own state index.",
       schedule: "0 * * * *",
     },
   ],
@@ -139,12 +139,12 @@ const manifest: PaperclipPluginManifestV1 = {
       workerAdminGroupId: {
         type: "string",
         default: "",
-        description: "Optional override for the Individual Workers Admin permission group id. Empty resolves it by name at provision time.",
+        description: "Required: Cloudflare permission group id for Individual Workers Admin. Empty disables provisioning (fail closed); never looked up by name at runtime.",
       },
       r2ItemWriteGroupId: {
         type: "string",
         default: "",
-        description: "Optional override for the Workers R2 Storage Bucket Item Write permission group id. Empty resolves it by name at provision time.",
+        description: "Required: Cloudflare permission group id for Workers R2 Storage Bucket Item Write. Empty disables provisioning (fail closed); never looked up by name at runtime.",
       },
     },
   },
