@@ -22,6 +22,21 @@ export class CfError extends Error {
 }
 
 /**
+ * A successful script upload that returned no `tag`. The Worker exists and —
+ * because provision pre-checks the name — is ours, but no token can ever
+ * scope to it. Provision catches this to delete the Worker by name before
+ * failing closed; without the `scriptName` the Worker would leak untracked.
+ */
+export class MissingWorkerTagError extends CfError {
+  readonly scriptName: string;
+  constructor(status: number, body: string, scriptName: string) {
+    super(status, body, `Cloudflare PUT workers/scripts/${scriptName}: response has no script tag; refusing to scope a token without it`);
+    this.name = "MissingWorkerTagError";
+    this.scriptName = scriptName;
+  }
+}
+
+/**
  * True for Cloudflare authentication failures (bad/expired credential, or a
  * request.ip filter that doesn't cover the caller — the canary showed filter
  * violations surface as 401). Cloudflare locks the caller out after repeated
@@ -190,11 +205,7 @@ export class CfClient {
       );
     }
     if (!parsed.result || typeof parsed.result.tag !== "string" || !parsed.result.tag) {
-      throw new CfError(
-        res.status,
-        text.slice(0, 500),
-        `Cloudflare PUT workers/scripts/${name}: response has no script tag; refusing to scope a token without it`,
-      );
+      throw new MissingWorkerTagError(res.status, text.slice(0, 500), name);
     }
     return parsed.result;
   }

@@ -21,6 +21,12 @@ export interface RecordedCall {
 export class FakeCf {
   readonly calls: RecordedCall[] = [];
   scripts = new Map<string, { id: string; tag: string }>();
+  /**
+   * When true, script uploads return `{id, name}` with no `tag`, simulating
+   * a tag-less success. Provision must fail closed AND delete the leaked
+   * Worker by name instead of dropping the record.
+   */
+  omitScriptTagOnPut = false;
   dbs = new Map<string, { name: string }>();
   namespaces = new Map<string, { title: string }>();
   buckets = new Map<string, { objects: string[] }>();
@@ -116,7 +122,7 @@ export class FakeCf {
       const name = decodeURIComponent(m[1]!);
       const tag = `tag-${name}`;
       this.scripts.set(name, { id: name, tag });
-      return ok({ id: name, tag, name });
+      return this.omitScriptTagOnPut ? ok({ id: name, name }) : ok({ id: name, tag, name });
     }
     const settings = path.match(/^\/accounts\/[^/]+\/workers\/scripts\/([^/]+)\/settings$/);
     if (settings && method === "GET") {

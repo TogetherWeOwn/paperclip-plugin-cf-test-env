@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CfClient, CfError, isAuthenticationFailure } from "./cloudflare.js";
+import { CfClient, CfError, MissingWorkerTagError, isAuthenticationFailure } from "./cloudflare.js";
 import { FakeCf } from "./test-support/fake-cf.js";
 
 describe("CfClient", () => {
@@ -211,7 +211,8 @@ describe("CfClient", () => {
 
   it("fails closed when the upload response has no script tag", async () => {
     // Scoping by script name is rejected by token creation (500 1004), so a
-    // tag-less upload must never reach the mint step.
+    // tag-less upload must never reach the mint step. The dedicated error
+    // carries the script name so provision can delete the leaked Worker.
     const cf = new CfClient(
       async () =>
         new Response(JSON.stringify({ success: true, errors: [], result: { id: "pct-notag", name: "pct-notag" } }), {
@@ -221,7 +222,12 @@ describe("CfClient", () => {
       "mint",
       "acct-1",
     );
-    await expect(cf.createWorkerScript("pct-notag")).rejects.toThrow(/no script tag/);
+    const err = await cf.createWorkerScript("pct-notag").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(MissingWorkerTagError);
+    expect((err as MissingWorkerTagError).scriptName).toBe("pct-notag");
   });
 
   it("treats 404 on DELETE as success (idempotent teardown)", async () => {

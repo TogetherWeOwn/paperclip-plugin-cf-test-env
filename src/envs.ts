@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { CfClient, isAuthenticationFailure, type FetchImpl } from "./cloudflare.js";
+import { CfClient, MissingWorkerTagError, isAuthenticationFailure, type FetchImpl } from "./cloudflare.js";
 import { checkProvisionAllowed, type CfTestEnvConfig } from "./config.js";
 import { ENV_DOC_KEY } from "./manifest.js";
 import {
@@ -345,6 +345,16 @@ export async function provision(
     // was created (e.g. a preflight 401): then there is nothing to clean up,
     // and keeping the record would only count against the concurrency cap
     // until the sweep reaps it as stale.
+    //
+    // Tag-less upload: reaching MissingWorkerTagError means the PUT returned
+    // 200, so the Worker exists and is ours (the pre-create check passed) —
+    // but no token can scope to it. Mark it created by name (the tag never
+    // arrived, and this record never goes live so the name is never used as
+    // a scope) so rollback deletes it by name and the sweep retries if that
+    // fails. Without this the Worker would leak untracked.
+    if (err instanceof MissingWorkerTagError) {
+      progress.workerId = err.scriptName;
+    }
     const created = [
       progress.tokenId,
       progress.workerId,
