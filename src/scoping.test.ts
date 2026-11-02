@@ -5,6 +5,7 @@ import {
   buildTokenPolicies,
   buildTokenRequest,
   clampTtl,
+  normalizeCidr,
   R2_BUCKET_RESOURCE,
   toCloudflareTimestamp,
   WORKER_SCRIPT_RESOURCE,
@@ -161,6 +162,57 @@ describe("assertMintedTokenMatches", () => {
     expect(() => assertMintedTokenMatches(partial, expected)).toThrow(/verification/);
   });
 
+  it("accepts CIDRs Cloudflare spells differently but means the same", () => {
+    // Cloudflare may store the IPv6 /64 expanded, upper-cased or
+    // zero-padded. The raw-string comparison revoked such tokens even
+    // though the granted networks were exactly those requested.
+    const respelt: string[][] = [
+      ["203.0.113.10/32", "2001:0db8:0008:cb76:0000:0000:0000:0000/64"],
+      ["203.0.113.10/32", "2001:DB8:8:CB76::/64"],
+      ["203.0.113.10/32", "2001:db8:0008:cb76:0:0:0:0/64"],
+      // Host bits set within the prefix still name the same network.
+      ["203.0.113.10/32", "2001:db8:8:cb76:dead:beef:0:1/64"],
+      // A bare host address is the full-length prefix.
+      ["203.0.113.10", "2001:db8:8:cb76::/64"],
+    ];
+    for (const list of respelt) {
+      const actual = { ...minted, condition: { "request.ip": { in: list } } };
+      expect(() => assertMintedTokenMatches(actual, expected), JSON.stringify(list)).not.toThrow();
+    }
+  });
+
+  it("rejects genuinely different CIDR lists however they are spelled", () => {
+    const different: string[][] = [
+      // Different IPv6 network.
+      ["203.0.113.10/32", "2001:db8:8:cb77::/64"],
+      // Different IPv4 network.
+      ["203.0.113.11/32", "2001:db8:8:cb76::/64"],
+      // Wider and narrower prefixes are different grants.
+      ["203.0.113.0/24", "2001:db8:8:cb76::/64"],
+      ["203.0.113.10/32", "2001:db8:8::/48"],
+      ["203.0.113.10/32", "2001:db8:8:cb76::/128"],
+      // Extra entry, and a duplicate masking a missing entry.
+      ["203.0.113.10/32", "2001:db8:8:cb76::/64", "10.0.0.0/8"],
+      ["203.0.113.10/32", "203.0.113.10/32"],
+      // Unparsable entries never match, on either side of the comparison.
+      ["203.0.113.10/32", "not-a-cidr"],
+      ["203.0.113.10/32", "2001:db8:8:cb76::/129"],
+    ];
+    for (const list of different) {
+      const actual = { ...minted, condition: { "request.ip": { in: list } } };
+      expect(() => assertMintedTokenMatches(actual, expected), JSON.stringify(list)).toThrow(/CIDR list/);
+    }
+  });
+
+  it("rejects matching unparsable entries on both sides", () => {
+    // Without the `v !== null` guard in assertMintedTokenMatches, the same
+    // unparsable entry on both sides would normalize to null === null in
+    // the sorted comparison and pass. Pin the fail-closed behaviour.
+    const badExpected = { ...expected, egressCidrs: ["203.0.113.10/32", "not-a-cidr"] };
+    const badActual = { ...minted, condition: { "request.ip": { in: ["203.0.113.10/32", "not-a-cidr"] } } };
+    expect(() => assertMintedTokenMatches(badActual, badExpected)).toThrow(/CIDR list/);
+  });
+
   it("rejects a dropped IP condition, a later expiry, and shape drift", () => {
     expect(() => assertMintedTokenMatches({ ...minted, condition: {} }, expected)).toThrow(/verification/);
     expect(() =>
@@ -215,6 +267,44 @@ describe("assertMintedTokenMatches", () => {
     expect(() => assertMintedTokenMatches({ ...minted, policies: deffect }, expected)).toThrow(
       /policies differ/,
     );
+  });
+});
+
+describe("normalizeCidr", () => {
+  it("canonicalizes case, compression, leading zeros and host bits", () => {
+    expect(normalizeCidr("2001:DB8:8:CB76::/64")).toBe("2001:db8:8:cb76::/64");
+    expect(normalizeCidr("2001:0db8:0008:cb76:0000:0000:0000:0000/64")).toBe("2001:db8:8:cb76::/64");
+    expect(normalizeCidr("2001:db8:8:cb76:dead:beef:0:1/64")).toBe("2001:db8:8:cb76::/64");
+    expect(normalizeCidr("203.0.113.10/24")).toBe("203.0.113.0/24");
+    expect(normalizeCidr("203.0.113.10")).toBe("203.0.113.10/32");
+    expect(normalizeCidr("::1")).toBe("::1/128");
+    expect(normalizeCidr("::/0")).toBe("::/0");
+    expect(normalizeCidr("::ffff:192.0.2.1/128")).toBe("::ffff:c000:201/128");
+    // Only the longest zero run compresses; a single zero group does not.
+    expect(normalizeCidr("2001:db8:0:1:2:3:4:5/128")).toBe("2001:db8:0:1:2:3:4:5/128");
+  });
+
+  it("returns null for anything that is not a CIDR", () => {
+    for (const bad of [
+      "",
+      " ",
+      "example.com",
+      "203.0.113.10/33",
+      "203.0.113.10/-1",
+      "203.0.113.256/32",
+      "203.0.113/24",
+      "010.0.0.0/8", // leading-zero octet: octal in some parsers
+      "2001:db8:8:cb76::/129",
+      "2001:db8:::1/64",
+      "2001:db8:8:cb76:0:0:0:0:0/64",
+      "fe80::1%eth0/64",
+      "2001:db8::1/64/extra",
+      42,
+      null,
+      undefined,
+    ]) {
+      expect(normalizeCidr(bad), JSON.stringify(bad)).toBeNull();
+    }
   });
 });
 
