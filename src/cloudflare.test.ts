@@ -53,10 +53,26 @@ describe("CfClient", () => {
     expect(fake.tokens.size).toBe(0);
   });
 
-  it("uploads Worker scripts as multipart form data, not JSON", async () => {
+  it("uploads Worker scripts as a string-built multipart body, never FormData", async () => {
+    // Through ctx.http.fetch the plugin SDK serializes non-string
+    // bodies with String(body) — a FormData would reach Cloudflare as the
+    // text "[object FormData]" and fail 415. The fetch here mirrors that
+    // serialization exactly, then parses the result as a real multipart
+    // request the way Cloudflare would.
     let seen: RequestInit | undefined;
-    const cf = new CfClient(async (_url: string, init?: RequestInit) => {
+    const cf = new CfClient(async (url: string, init?: RequestInit) => {
       seen = init;
+      // Mirror the SDK's http.fetch: only string bodies survive.
+      const body = init?.body === undefined || init?.body === null
+        ? undefined
+        : typeof init.body === "string" ? init.body : String(init.body);
+      const req = new Request(url, { method: init?.method, headers: init?.headers, body });
+      const form = await req.formData();
+      expect(form.get("metadata")).toBeTruthy();
+      const modulePart = form.get("worker.js");
+      expect(modulePart).toBeInstanceOf(Blob);
+      expect(((modulePart as Blob).type)).toBe("application/javascript+module");
+      expect(await (modulePart as Blob).text()).toContain("pct stub");
       return new Response(JSON.stringify({ success: true, errors: [], result: { id: "pct-multi", tag: "tag-pct-multi" } }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -65,12 +81,16 @@ describe("CfClient", () => {
     const created = await cf.createWorkerScript("pct-multi");
     expect(created.tag).toBe("tag-pct-multi");
     expect(seen?.method).toBe("PUT");
-    expect(seen?.body).toBeInstanceOf(FormData);
-    // fetch sets the multipart boundary itself; a JSON content-type would
-    // override it and the upload would be rejected.
-    expect(JSON.stringify(seen?.headers ?? {})).not.toContain("application/json");
-    const form = seen?.body as FormData;
-    expect(form.has("metadata")).toBe(true);
+    expect(typeof seen?.body).toBe("string");
+    const headers = seen?.headers as Record<string, string>;
+    expect(headers["Content-Type"]).toMatch(/^multipart\/form-data; boundary=.+/);
+    const body = seen?.body as string;
+    const boundary = headers["Content-Type"].split("boundary=")[1]!;
+    expect(body.startsWith(`--${boundary}\r\n`)).toBe(true);
+    expect(body).toContain(`--${boundary}--\r\n`);
+    expect(body).toContain(`name="metadata"`);
+    expect(body).toContain(`"main_module":"worker.js"`);
+    expect(body).toContain(`name="worker.js"; filename="worker.js"`);
   });
 
   it("lists R2 bucket names", async () => {

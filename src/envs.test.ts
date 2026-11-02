@@ -112,10 +112,10 @@ describe("provision", () => {
   it("refuses to overwrite a pre-existing Worker and leaves it intact", async () => {
     const { harness, fake, deps, run, issue } = await setup();
     const name = workerNameFor("pct-", issue.id, "abc123");
-    await fake.fetch(`https://api.cloudflare.com/client/v4/accounts/acct-1/workers/scripts/${name}`, {
-      method: "PUT",
-      body: JSON.stringify({ script: "someone else's worker" }),
-    });
+    // Seed directly: the fake's PUT only accepts the plugin's strict
+    // multipart-string shape, and this Worker belongs to someone
+    // else — it was never uploaded through the plugin.
+    fake.scripts.set(name, { id: name, tag: `tag-${name}` });
     fake.calls.length = 0;
     await expect(
       provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: issue.id }, deps),
@@ -423,7 +423,7 @@ describe("d1_execute", () => {
       d1Execute(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { envId: "pct-nope-000000", sql: "select 1" }, deps),
     ).rejects.toThrow(/not found/);
     const oldIssue = await harness.ctx.issues.create({ companyId: COMPANY, title: "old", projectId: PROJ, assigneeAgentId: AGENT });
-    const oldDeps = { ...deps, nowMs: Date.now() - 20000 * 1000, randHex: "cccccc" };
+    const oldDeps = { ...deps, nowMs: NOW - 5 * 3600 * 1000, randHex: "cccccc" };
     const provisioned = await provision(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { issueId: oldIssue.id }, oldDeps);
     await expect(
       d1Execute(ctxOf(harness), resolveConfig({ ...baseConfig }), run, { envId: provisioned.envId, sql: "select 1" }, deps),

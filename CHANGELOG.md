@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.2
+
+- Script uploads build the multipart body as a string with an
+  explicit boundary (through `ctx.http.fetch` the plugin SDK `String()`s
+  non-string bodies, so a `FormData` reached Cloudflare as the text
+  `[object FormData]` and provision failed 415); every tool result now
+  carries a record `data` plus readable `content` — including failures —
+  so the MCP gateway never emits `structuredContent: null` and the agent
+  sees the real error.
 - Operator canary fixes: per-Worker token nests under
   `com.cloudflare.api.account.<acct>` keyed on the script `tag` (flat keys
   fail creation with `500 1004`); `createWorkerScript` returns the tag and
