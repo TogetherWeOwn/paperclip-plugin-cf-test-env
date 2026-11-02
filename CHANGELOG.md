@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Minted-token verification compares canonical CIDRs, not raw strings:
+  Cloudflare may store the token `request.ip` condition with the IPv6
+  network spelled differently (expanded groups, upper-case hex, leading
+  zeros, host bits shown), which made `provision` revoke semantically
+  identical tokens. Both sides are now parsed and normalized (lowercase,
+  RFC 5952 compression, host bits masked to the prefix) before comparison;
+  a genuinely different list — different network, prefix length, or count —
+  still fails verification and revokes the token.
+
 ## 0.1.2
 
 - Script uploads build the multipart body as a string with an
