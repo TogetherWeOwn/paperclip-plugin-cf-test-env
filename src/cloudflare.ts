@@ -176,18 +176,36 @@ export class CfClient {
    */
   async createWorkerScript(name: string): Promise<{ id: string; tag: string }> {
     const stub = `export default { async fetch() { return new Response("pct stub", { status: 200 }); } };`;
-    const form = new FormData();
-    form.set(
-      "metadata",
-      new Blob([JSON.stringify({ main_module: "worker.js", bindings: [] })], {
-        type: "application/json",
-      }),
-    );
-    form.set("worker.js", new Blob([stub], { type: "application/javascript+module" }), "worker.js");
+    // The multipart body is built as a string with an explicit boundary —
+    // never a FormData. In the plugin worker this request goes through
+    // ctx.http.fetch, and the plugin SDK serializes non-string bodies with
+    // String(body): a FormData reaches Cloudflare as the text
+    // "[object FormData]" with no multipart Content-Type and the upload
+    // fails 415. Both parts are plain plugin-controlled text, so
+    // a hand-rolled string body is safe; the random boundary cannot appear
+    // in either part.
+    const boundary = `----pct-${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+    const body = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="metadata"`,
+      `Content-Type: application/json`,
+      ``,
+      JSON.stringify({ main_module: "worker.js", bindings: [] }),
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="worker.js"; filename="worker.js"`,
+      `Content-Type: application/javascript+module`,
+      ``,
+      stub,
+      `--${boundary}--`,
+      ``,
+    ].join("\r\n");
     const res = await this.fetchImpl(`${CF_API}/accounts/${this.accountId}/workers/scripts/${name}`, {
       method: "PUT",
-      headers: { Authorization: `Bearer ${this.apiToken}` },
-      body: form,
+      headers: {
+        Authorization: `Bearer ${this.apiToken}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      },
+      body,
     });
     const text = await res.text();
     let parsed: { success?: boolean; errors?: Array<{ message?: string }>; result?: { id: string; tag: string } } = {};

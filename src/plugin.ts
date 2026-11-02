@@ -4,6 +4,18 @@ import { resolveConfig } from "./config.js";
 import { d1Execute, handleIssueUpdated, provision, sweep, teardown } from "./envs.js";
 import { D1_EXECUTE_TOOL, PROVISION_TOOL, SWEEP_JOB_KEY, TEARDOWN_TOOL } from "./manifest.js";
 
+/**
+ * Every tool result must carry a record `data` (plus readable `content`
+ * and, on failure, the `error` string). The MCP gateway maps `data` to
+ * `structuredContent`; when `data` is absent it becomes null and the
+ * agent's MCP client rejects the whole result ("expected record, received
+ * null"), so the real error never reaches the agent.
+ */
+function toolError(err: unknown): { error: string; data: { error: { message: string } }; content: string } {
+  const message = err instanceof Error ? err.message : String(err);
+  return { error: message, data: { error: { message } }, content: `Error: ${message}` };
+}
+
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
     ctx.tools.register(
@@ -26,7 +38,7 @@ const plugin = definePlugin({
           const config = resolveConfig(await ctx.config.get(runCtx.companyId));
           const input = (params ?? {}) as { issueId?: string; ttlSeconds?: number };
           if (typeof input.issueId !== "string" || !input.issueId) {
-            return { error: "issueId is required." };
+            return toolError(new Error("issueId is required."));
           }
           const result = await provision(ctx, config, runCtx, { issueId: input.issueId, ttlSeconds: input.ttlSeconds }, {
             fetchImpl: (url, init) => ctx.http.fetch(url, init),
@@ -44,7 +56,7 @@ const plugin = definePlugin({
             ].join("\n"),
           };
         } catch (err) {
-          return { error: err instanceof Error ? err.message : String(err) };
+          return toolError(err);
         }
       },
     );
@@ -71,14 +83,14 @@ const plugin = definePlugin({
         try {
           const config = resolveConfig(await ctx.config.get(runCtx.companyId));
           const input = (params ?? {}) as { envId?: string; sql?: string; params?: unknown[] };
-          if (typeof input.envId !== "string" || !input.envId) return { error: "envId is required." };
-          if (typeof input.sql !== "string" || !input.sql) return { error: "sql is required." };
+          if (typeof input.envId !== "string" || !input.envId) return toolError(new Error("envId is required."));
+          if (typeof input.sql !== "string" || !input.sql) return toolError(new Error("sql is required."));
           const rows = await d1Execute(ctx, config, runCtx, { envId: input.envId, sql: input.sql, params: input.params }, {
             fetchImpl: (url, init) => ctx.http.fetch(url, init),
           });
-          return { data: rows, content: JSON.stringify(rows).slice(0, 4000) };
+          return { data: { results: rows }, content: JSON.stringify(rows).slice(0, 4000) };
         } catch (err) {
-          return { error: err instanceof Error ? err.message : String(err) };
+          return toolError(err);
         }
       },
     );
@@ -100,7 +112,7 @@ const plugin = definePlugin({
         try {
           const config = resolveConfig(await ctx.config.get(runCtx.companyId));
           const input = (params ?? {}) as { envId?: string };
-          if (typeof input.envId !== "string" || !input.envId) return { error: "envId is required." };
+          if (typeof input.envId !== "string" || !input.envId) return toolError(new Error("envId is required."));
           const { errors } = await teardown(
             ctx,
             config,
@@ -112,10 +124,10 @@ const plugin = definePlugin({
             // Agent-initiated: enforce the owner/assignee + allow-list gate.
             { agentId: runCtx.agentId },
           );
-          if (errors.length > 0) return { error: `Teardown incomplete: ${errors.join("; ").slice(0, 1000)}` };
-          return { content: `Test env ${input.envId} torn down.` };
+          if (errors.length > 0) return toolError(new Error(`Teardown incomplete: ${errors.join("; ").slice(0, 1000)}`));
+          return { data: { envId: input.envId, tornDown: true }, content: `Test env ${input.envId} torn down.` };
         } catch (err) {
-          return { error: err instanceof Error ? err.message : String(err) };
+          return toolError(err);
         }
       },
     );

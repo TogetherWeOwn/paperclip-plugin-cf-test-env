@@ -115,10 +115,32 @@ export class FakeCf {
     // Workers scripts
     let m = path.match(/^\/accounts\/[^/]+\/workers\/scripts\/([^/]+)$/);
     if (m && method === "PUT") {
-      // Accepts the real multipart upload (body is FormData, not JSON); the
-      // fake only tracks existence by name from the path. Like the real API,
-      // the response carries `id` = script name plus a separate `tag` =
-      // Worker ID, which is what the per-Worker token is scoped to.
+      // The fake receives fetches the way ctx.http.fetch delivers them in
+      // the plugin worker: the SDK's http.fetch String()s non-string bodies,
+      // so the upload must be a string-built multipart body, never FormData
+      // (a FormData arrived as "[object FormData]" and the real
+      // API answered 415). Enforce the same shape here so every test above
+      // this layer proves the upload survives the SDK boundary. Existence
+      // is tracked by name from the path. Like the real API, the response
+      // carries `id` = script name plus a separate `tag` = Worker ID, which
+      // is what the per-Worker token is scoped to.
+      if (typeof init?.body !== "string") {
+        return apiError(415, "Content-Type must be one of: application/javascript, text/javascript, multipart/form-data");
+      }
+      const contentType = new Headers(init.headers).get("content-type") ?? "";
+      const boundaryMatch = contentType.match(/^multipart\/form-data; boundary=(.+)$/);
+      if (!boundaryMatch) {
+        return apiError(415, "Content-Type must be one of: application/javascript, text/javascript, multipart/form-data");
+      }
+      const boundary = boundaryMatch[1]!;
+      if (
+        !init.body.startsWith(`--${boundary}\r\n`) ||
+        !init.body.includes(`name="metadata"`) ||
+        !init.body.includes(`name="worker.js"`) ||
+        !init.body.includes(`--${boundary}--`)
+      ) {
+        return apiError(400, "malformed multipart upload");
+      }
       const name = decodeURIComponent(m[1]!);
       const tag = `tag-${name}`;
       this.scripts.set(name, { id: name, tag });

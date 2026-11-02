@@ -95,7 +95,70 @@ describe("plugin wiring", () => {
 
     const torn = await harness.executeTool(TEARDOWN_TOOL, { envId: data.envId }, run);
     expect(torn.error).toBeUndefined();
+    expect(torn.data).toEqual({ envId: data.envId, tornDown: true });
     expect(fake.scripts.size).toBe(0);
+  });
+
+  // The MCP gateway maps `data` to structuredContent; a result
+  // without `data` becomes structuredContent: null and the agent's client
+  // rejects the whole result, hiding the real error. Every return path —
+  // failure or success — must carry a record `data` plus readable content.
+  it("every tool result carries a record data and readable content, failures included", async () => {
+    const { harness, issue, run } = await setup();
+    const assertShape = (res: { data?: unknown; content?: unknown; error?: string }) => {
+      expect(res.data).not.toBeNull();
+      expect(typeof res.data).toBe("object");
+      expect(Array.isArray(res.data)).toBe(false);
+      expect(typeof res.content).toBe("string");
+      expect((res.content as string).length).toBeGreaterThan(0);
+      if (res.error) {
+        expect(res.data).toEqual({ error: { message: res.error } });
+        expect(res.content).toContain(res.error);
+      }
+    };
+
+    // Provision failure (validation and thrown), then success.
+    assertShape(await harness.executeTool(PROVISION_TOOL, {}, run));
+    const badProvision = await harness.executeTool(PROVISION_TOOL, { issueId: "no-such-issue" }, run);
+    expect(badProvision.error).toBeTruthy();
+    assertShape(badProvision);
+    const provisioned = await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run);
+    expect(provisioned.error).toBeUndefined();
+    assertShape(provisioned);
+    const data = toolData(provisioned);
+
+    // d1_execute failure (unknown env — the exact case the agent never saw),
+    // validation failures, then success (data must be a record, not the raw
+    // result array).
+    assertShape(await harness.executeTool(D1_EXECUTE_TOOL, { sql: "select 1" }, run));
+    assertShape(await harness.executeTool(D1_EXECUTE_TOOL, { envId: data.envId }, run));
+    const badQuery = await harness.executeTool(D1_EXECUTE_TOOL, { envId: "pct-nope-000000", sql: "select 1" }, run);
+    expect(badQuery.error).toMatch(/not found/);
+    assertShape(badQuery);
+    const queried = await harness.executeTool(D1_EXECUTE_TOOL, { envId: data.envId, sql: "select 1" }, run);
+    expect(queried.error).toBeUndefined();
+    assertShape(queried);
+    expect(queried.data).toEqual({ results: [{ results: [] }] });
+
+    // Teardown validation failure, then success (previously no `data`).
+    assertShape(await harness.executeTool(TEARDOWN_TOOL, {}, run));
+    const torn = await harness.executeTool(TEARDOWN_TOOL, { envId: data.envId }, run);
+    expect(torn.error).toBeUndefined();
+    assertShape(torn);
+  });
+
+  it("reports an incomplete teardown as a shaped error result", async () => {
+    const { harness, fake, issue, run } = await setup();
+    const provisioned = await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run);
+    const data = toolData(provisioned);
+    // failOn matches a substring of "METHOD path"; post-provision only the
+    // teardown DELETE touches this script's path.
+    fake.failOn = [`workers/scripts/${data.workerName}`];
+    const torn = await harness.executeTool(TEARDOWN_TOOL, { envId: data.envId }, run);
+    expect(torn.error).toMatch(/Teardown incomplete/);
+    expect(torn.data).toEqual({ error: { message: torn.error! } });
+    expect(typeof torn.content).toBe("string");
+    expect(torn.content).toContain("Teardown incomplete");
   });
 
   it("tears down the card's env when the card closes", async () => {

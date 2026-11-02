@@ -464,12 +464,12 @@ export async function d1Execute(
   config: CfTestEnvConfig,
   run: ToolRunContext,
   input: { envId: string; sql: string; params?: unknown[] },
-  deps: { fetchImpl: FetchImpl; resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string> },
+  deps: { fetchImpl: FetchImpl; nowMs?: number; resolveMintToken?: (secretRef: unknown, companyId: string) => Promise<string> },
 ): Promise<unknown> {
   const env = await readEnv(ctx, run.companyId, input.envId);
   if (!env) throw new Error("Test env not found or already torn down.");
   await authorizeEnvCaller(ctx, config, run, env);
-  if (Date.parse(env.expiresAt) <= Date.now()) {
+  if (Date.parse(env.expiresAt) <= (deps.nowMs ?? Date.now())) {
     throw new Error("Test env expired; provision a fresh one.");
   }
   if (!config.tokenSecretRef || !config.accountId) {
