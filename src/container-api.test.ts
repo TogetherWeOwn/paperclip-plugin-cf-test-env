@@ -190,6 +190,15 @@ describe("operation identity and request exclusion", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("permanently stops all clients in the shared attempt after transport failure", async () => {
+    const { api, fetch, session } = fixture([new Error(internalToken), envelope(app)]);
+    await expect(api.readOwned(env)).rejects.toMatchObject({ code: "transport_failed" });
+    await expect(api.readOwned(env)).rejects.toMatchObject({ code: "transport_failed" });
+    const other = new ContainerApplicationApi(fetch, "bootstrap-secret-canary", env.accountId, session);
+    await expect(other.findOwned(env)).rejects.toMatchObject({ code: "transport_failed" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("holds request exclusion through response parsing, not only fetch", async () => {
     let release!: (text: string) => void;
     const response = envelope(app);

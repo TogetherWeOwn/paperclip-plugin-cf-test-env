@@ -29,6 +29,7 @@ export class ContainerApiError extends Error {
 /** Share across all credentials in one lifecycle attempt, including revocation. */
 export class ContainerApiSession {
   #authenticationFailed = false;
+  #transportFailed = false;
   #inFlight = false;
 
   /** No queue: a pending request can still fail authentication or be ambiguous. */
@@ -49,8 +50,16 @@ export class ContainerApiSession {
     throw new ContainerApiError("authentication_failed", 401);
   }
 
+  stopAfterTransportFailure(): never {
+    // RPC timeout rejects locally without cancelling host/provider work. This
+    // attempt cannot dispatch again, even if a late host reply eventually arrives.
+    this.#transportFailed = true;
+    throw new ContainerApiError("transport_failed");
+  }
+
   assertCallable(): void {
     if (this.#authenticationFailed) throw new ContainerApiError("authentication_failed", 401);
+    if (this.#transportFailed) throw new ContainerApiError("transport_failed");
   }
 }
 
@@ -111,7 +120,7 @@ export class ContainerApplicationApi {
       });
     } catch {
       // Network exceptions can include URLs/headers. Never keep their cause.
-      throw new ContainerApiError("transport_failed");
+      this.#session.stopAfterTransportFailure();
     }
     if (response.status === 401) this.#session.stopAfterAuthenticationFailure();
     if (response.status === 404 && allowAbsent) return null;

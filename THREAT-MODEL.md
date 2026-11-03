@@ -264,9 +264,14 @@ absence, silently extending the authorized window or relaxing the spend scope.
   credential. The session refuses overlapping bootstrap/application requests and
   holds exclusion through response parsing; it does not queue calls behind a
   possible 401. Detached application work prevents a concurrent revocation receipt
-  and causes lifecycle failure with retained recovery intent. This is process-local
-  request exclusion, not cross-process operation fencing; all lifecycle entrypoints
-  must still use durable claims.
+  and causes lifecycle failure with retained recovery intent. Any rejected host fetch
+  permanently quarantines the shared attempt, including bootstrap revocation calls:
+  the SDK can time out locally while its host HTTP request remains unsettled. A late
+  host reply does not reopen the attempt. A callback that swallows a 401 or transport
+  failure cannot return broker success. Credential intent/IDs remain for recovery;
+  do not construct a new session to bypass this boundary on the same claim. This is
+  process-local containment, not cross-process operation fencing; all lifecycle
+  entrypoints must still use durable claims.
 - Network failure, missing acknowledged ID, failed persistence, partial create,
   or failed absence verification leaves recovery work; it is not successful
   teardown. Token intent must be durable before POST, including ambiguous mints.
@@ -293,7 +298,11 @@ awaiting the host, and fixed errors before secret/HTTP access. Isolated PostgreS
 fixtures use independent connections to exercise actual conditional reservation,
 journal-write and approval-burn contention, foreign-company isolation, persisted
 claims, lost commit replies and retained closed slots. CI requires these database
-fixtures rather than silently skipping them.
+fixtures rather than silently skipping them. An in-memory round trip through the
+installed SDK additionally proves a caller timeout leaves its HTTP call unsettled
+(the idle-drain stays `present` until a late host reply); the shared attempt refuses
+new calls both before and after that reply. This fixture makes no real HTTP request
+and does not reproduce a host process crash or prove provider settlement.
 
 Before release, add integration fixtures for the actual registered handlers,
 full teardown ordering, stale-writer-safe restart and ambiguous-create recovery,

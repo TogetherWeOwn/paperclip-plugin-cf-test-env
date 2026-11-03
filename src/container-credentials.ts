@@ -105,7 +105,7 @@ export class ContainerCredentialBroker {
         method, headers: { Authorization: `Bearer ${this.#bootstrap}`, "Content-Type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body), redirect: "error",
       });
-    } catch { throw new ContainerApiError("transport_failed"); }
+    } catch { this.#session.stopAfterTransportFailure(); }
     if (response.status === 401) this.#session.stopAfterAuthenticationFailure();
     if (response.status === 404 && allowAbsent) return null;
     if (!response.ok) throw new ContainerApiError("cloudflare_failed", response.status);
@@ -182,14 +182,17 @@ export class ContainerCredentialBroker {
         }
         if (purpose === "deploy") assertContainerActive(env, time);
       };
-      return await run(new ContainerApplicationApi(this.#fetch, minted.value, this.#accountId, this.#session, assertCurrent));
+      const result = await run(new ContainerApplicationApi(this.#fetch, minted.value, this.#accountId, this.#session, assertCurrent));
+      this.#session.assertCallable();
+      return result;
     } catch (err) {
       if (err instanceof ContainerApiError || err instanceof ContainerCredentialError || err instanceof ContainerRefusal) throw err;
       throw new ContainerCredentialError("operation_failed");
     } finally {
       open = false;
       // A 401 forbids even cleanup calls in this attempt; the durable ID remains.
-      // An outstanding detached request also prevents a false revocation receipt.
+      // Outstanding detached work or quarantined transport also prevents a
+      // revocation call/receipt; the non-secret recovery obligation remains.
       if (id && !this.#session.authenticationFailed) await this.revokeAndVerify(id, journal);
     }
   }

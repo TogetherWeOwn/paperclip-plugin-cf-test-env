@@ -166,6 +166,30 @@ describe("in-memory credential lifecycle", () => {
     expect(f.fetch).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["preflight", "mint", "read-back", "application", "revoke", "absence"])("does not dispatch again after %s transport failure", async (stage) => {
+    const responses = [...mintSequence(), missing(), ...revokeSequence()];
+    const index = ["preflight", "mint", "read-back", "application", "revoke", "absence"].indexOf(stage);
+    const f = fixture([...responses.slice(0, index), new Error(`${bootstrap} ${internal}`), ...responses.slice(index + 1)]);
+    await expect(f.broker.withApplicationApi(f.opts, (api) => api.readOwned({ ...env, applicationId: "app" })))
+      .rejects.toMatchObject({ code: "transport_failed" });
+    await expect(f.broker.revokeAndVerify(tokenId, f.journal)).rejects.toMatchObject({ code: "transport_failed" });
+    await expect(f.broker.withApplicationApi(f.opts, vi.fn())).rejects.toMatchObject({ code: "transport_failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(index + 1);
+    expect(f.journal.revoked).not.toHaveBeenCalled();
+    secretFree(f.events);
+  });
+
+  it.each(["authentication_failed", "transport_failed"])("cannot report success when its callback swallows %s", async (code) => {
+    const response = code === "authentication_failed" ? new Response(internal, { status: 401 }) : new Error(internal);
+    const f = fixture([...mintSequence(), response, ...revokeSequence()]);
+    await expect(f.broker.withApplicationApi(f.opts, async (api) => {
+      try { await api.readOwned({ ...env, applicationId: "app" }); } catch { /* Simulate a callback incorrectly swallowing failure. */ }
+      return { ok: true };
+    })).rejects.toMatchObject({ code });
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+    expect(f.journal.revoked).not.toHaveBeenCalled();
+  });
+
   it("still attempts revocation after a 403 application failure", async () => {
     const f = fixture([...mintSequence(), new Response(internal, { status: 403 }), ...revokeSequence()]);
     await expect(f.broker.withApplicationApi(f.opts, (api) => api.readOwned({ ...env, applicationId: "app" })))
