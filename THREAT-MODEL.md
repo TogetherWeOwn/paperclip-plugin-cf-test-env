@@ -64,10 +64,20 @@ grant; the lifecycle must repeat it inside the claimed operation before secrets
 or remote mutations. Fixed errors do not reflect host exceptions.
 
 The PostgreSQL journal reserves one account-wide slot, not one slot per company.
+The pure Worker-ownership predicate matches script name and immutable script tag,
+pinned version ID, exactly one local `SANDBOX` binding of class `ContainerSandbox`,
+and independently read namespace script/class/ID. Preview, cross-script, dispatch
+and legacy-environment bindings refuse. The latest deployment must serve only the
+pinned version at 100%; finding that version in old history is not enough. Extra
+bindings (including AI, R2 and D1) refuse. Only success or fixed refusal is returned,
+not provider metadata.
+
 Required integration: preflight Worker absence; connect intent and acknowledged
-resource IDs to actual operations; verify uploaded Worker version, script tag,
-DO class and namespace. Return a fixed non-secret result. **No Worker Admin token
-is returned for a container environment.** A reservation alone is not a live env.
+resource IDs to actual operations; read evidence from the correct account/script
+endpoints under writer exclusion. The pure predicate does not attest freshness,
+bundle contents, runtime safety, or the absence of a concurrent writer. Return a
+fixed non-secret result. **No Worker Admin token is returned for a container
+environment.** A reservation alone is not a live env.
 
 ### `deploy_container`
 
@@ -223,6 +233,19 @@ already dispatched requests or prove an old process cannot reach its bootstrap
 credential. No recovery API may turn an inventory scan, a lease timeout or a
 permanent claim into permission to resume creates. The stale-writer protocol must
 settle those cases across process/host RPC boundaries before takeover is enabled.
+
+**Recovery feasibility gate:** inspection of the installed host/SDK and pinned
+provider schemas found no supported plugin-only way to quiesce predecessor
+writers or prove that an ambiguous mint, Worker upload or scheduled-application
+create will never commit. Worker crashes can drop responses while host handlers
+continue; the host has no durable epoch/dispatch ledger. A host-side ledger would
+still leave provider-accepted-unknown writes: the selected APIs supply no documented
+terminal cancellation/idempotency or maximum commit-latency guarantee. Bootstrap
+revocation or token expiry does not settle an already accepted request. Do not
+invent a delay, steal a claim, reuse a new session to escape quarantine, or call
+absence proof of terminal settlement. A source-backed recovery architecture is a
+release prerequisite; host-only fencing is not sufficient. No credential rotation
+or security/deadline/spend exception is authorized by this code.
 
 The migration is present as source but its database declaration/capabilities are
 not enabled yet. Runtime registration, persistent-host adapter integration,

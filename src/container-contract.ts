@@ -169,6 +169,46 @@ export function assertContainerNamespace(value: unknown, env: ContainerIdentity)
   }
 }
 
+/**
+ * Pure evidence check, not a freshness/authorization grant. The lifecycle must
+ * read each record from its account/script-scoped endpoint under writer exclusion.
+ * The deployments endpoint orders the actively serving deployment first.
+ */
+export function assertContainerWorkerOwnership(
+  script: unknown,
+  version: unknown,
+  deployments: unknown,
+  namespace: unknown,
+  env: ContainerIdentity,
+  versionId: string,
+): void {
+  assertContainerIdentity(env);
+  if (!safeId(versionId) || !isRecord(script) || script.id !== env.workerName || script.tag !== env.workerTag
+    || !isRecord(version) || version.id !== versionId || !isRecord(version.resources)
+    || !Array.isArray(version.resources.bindings) || version.resources.bindings.length !== 1) {
+    throw new ContainerRefusal("ownership_mismatch");
+  }
+  const binding: unknown = version.resources.bindings[0];
+  if (!isRecord(binding) || binding.name !== "SANDBOX" || binding.type !== "durable_object_namespace"
+    || binding.class_name !== CONTAINER_CLASS || binding.namespace_id !== env.namespaceId
+    || (binding.script_name !== undefined && binding.script_name !== env.workerName)
+    || binding.environment !== undefined || binding.dispatch_namespace !== undefined) {
+    throw new ContainerRefusal("ownership_mismatch");
+  }
+  assertContainerNamespace(namespace, env);
+  if (!isRecord(deployments) || !Array.isArray(deployments.deployments)) {
+    throw new ContainerRefusal("ownership_mismatch");
+  }
+  const latest: unknown = deployments.deployments[0];
+  if (!isRecord(latest) || latest.strategy !== "percentage" || !Array.isArray(latest.versions) || latest.versions.length !== 1) {
+    throw new ContainerRefusal("ownership_mismatch");
+  }
+  const active: unknown = latest.versions[0];
+  if (!isRecord(active) || active.version_id !== versionId || active.percentage !== 100) {
+    throw new ContainerRefusal("ownership_mismatch");
+  }
+}
+
 /** Ownership is separate from limits so an owned, misconfigured app can be cleaned up. */
 export function assertOwnedContainerApplication(value: unknown, env: ContainerIdentity): asserts value is Record<string, unknown> & { id: string } {
   assertContainerIdentity(env);
