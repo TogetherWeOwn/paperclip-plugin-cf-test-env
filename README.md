@@ -87,8 +87,30 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
 
 ```sh
 npm ci
-npm run check   # typecheck, tests, build
+npm run check   # typecheck, tests, build (SQL fixtures skip without a test DB)
 ```
+
+The container broker is an incomplete, unregistered implementation; see
+[`THREAT-MODEL.md`](THREAT-MODEL.md). Its coordination tests use real PostgreSQL,
+not an in-memory upsert/CAS mock. To include them locally, start an isolated
+PostgreSQL instance containing a database named `cf_broker_test`, then run:
+
+```sh
+CF_BROKER_TEST_DATABASE_URL=postgres://test_user@127.0.0.1:5432/cf_broker_test \
+CF_BROKER_REQUIRE_DATABASE_TESTS=1 npm run check
+```
+
+Use **only a disposable local test cluster**. The fixture creates the plugin's
+schema/table and cleans up its own test rows. It rejects non-loopback hosts,
+other database names, URL query parameters and fragments (including connection
+host/database overrides). The test driver is a development dependency; production
+code uses only the host's capability-scoped `ctx.db` interface. CI supplies an
+isolated PostgreSQL service and requires the database fixtures, so a missing test
+connection cannot silently pass there. No fixture calls Cloudflare.
+
+The source migration is not yet enabled in the manifest: no database capabilities,
+container tool registrations, live plugin migration or configuration changes are
+introduced by these foundations.
 
 ## License
 

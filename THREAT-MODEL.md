@@ -4,8 +4,9 @@
 
 **Work in progress; container tools are not registered.** The current change adds
 strict contracts, an application protocol client, an internal credential helper,
-and an independent-approval evidence predicate. It does not yet provide an
-operational container environment. The existing non-container tools and their
+an independent-approval evidence predicate, a PostgreSQL coordination journal,
+and current caller/checkout checks. It does not yet provide an operational
+container environment. The existing non-container tools and their
 behavior are unchanged.
 
 This document distinguishes implemented primitives from integration requirements.
@@ -54,13 +55,19 @@ Threats: confused-deputy provisioning for another company/issue/owner; concurren
 capacity bypass; predictable-name overwrite; untracked partial creates; returning
 an account credential or a Worker capability that defeats the trusted runtime.
 
-Implemented primitive: exact input validation and durable-identity validation.
-Required integration: authenticate the run, assert checkout ownership, verify the
-current issue assignee/project/status and allow-list before secret access; reserve
-capacity durably under serialization; preflight Worker absence; persist intent
-and acknowledged resource IDs; verify uploaded Worker version, script tag, DO
-class and namespace. Return a fixed non-secret result. **No Worker Admin token is
-returned for a container environment.** A reservation alone is not a live env.
+Implemented primitives: exact input/durable-identity validation; current host
+run/company/project/agent checks; authoritative issue assignee, project and
+`in_progress` status; exact checkout run ownership; configuration and issue
+rechecks after asynchronous checkout verification. The access helper has no
+secret or HTTP capability. Its result is a current precondition, not a reusable
+grant; the lifecycle must repeat it inside the claimed operation before secrets
+or remote mutations. Fixed errors do not reflect host exceptions.
+
+The PostgreSQL journal reserves one account-wide slot, not one slot per company.
+Required integration: preflight Worker absence; connect intent and acknowledged
+resource IDs to actual operations; verify uploaded Worker version, script tag,
+DO class and namespace. Return a fixed non-secret result. **No Worker Admin token
+is returned for a container environment.** A reservation alone is not a live env.
 
 ### `deploy_container`
 
@@ -161,13 +168,50 @@ a truncated search that does not find positive evidence, delayed audit writes,
 capability denials and ambiguous records all refuse. The broker must never request
 interaction-respond capability to approve its own action.
 
-**Not yet implemented:** persistent pin storage, one-shot burn-before-execution,
-serialization across lifecycle handlers/jobs/events, reviewed routing/config,
-and acceptance of this path by Security. An accepted interaction by itself is
-reusable and is not a consumption primitive. SDK `state.set` is an unconditional
-upsert, not CAS. A process-local mutex cannot establish cross-process exclusion;
-the single-writer deployment invariant or a host transactional claim must be
-established before registration. Do not infer it merely from a configuration flag.
+### Durable coordination primitive
+
+The installed host also provides restricted PostgreSQL access through `ctx.db`.
+The new journal uses one plugin-namespace table and parameterized single-statement
+DML, not a direct connection from production plugin code. INSERT with ON CONFLICT
+DO NOTHING reserves an account-wide slot. UPDATE compares both the expected
+revision and the complete old document; only an affected-row count of exactly one
+is a successful receipt. Zero means contention. Exceptions, missing capabilities,
+wrong namespace and malformed receipts fail closed without an SDK-state fallback.
+
+The journal stores the pin and permanently retains burned interaction IDs. After
+host evidence verification and a fresh expiry check, approval consumption and
+operation-claim acquisition happen in the same conditional UPDATE. The CAS baseline,
+operation, attempt and policy are captured before asynchronous verification. Both
+consent expiry and the deployment cutoff are checked again after the write receipt;
+a slow write cannot extend either window. A failed, expired or lost commit reply
+does not authorize a remote call or replay, even if a later read shows the claim.
+The committed burn and claim are retained. These cases use real PostgreSQL fixtures.
+Closed slots are retained: closing one env does not silently restart the cleared
+PoC budget window. Journal facts have exact allowed keys; no provider responses,
+arbitrary metadata, error strings or token values are stored.
+
+Containers token facts require an approval-backed deploy/teardown claim, never the
+unapproved provisioning claim. Credential intent, acknowledgement and verified
+revocation must follow a consistent sequence. Unresolved intent or revocation
+prevents successful completion and claim release. A live deployment additionally
+requires an acknowledged application. Closing requires token-absence evidence after
+the latest credential intent/acknowledgement, not a historical absence check.
+These are journal progression guards, not independent proof of provider state:
+lifecycle adapters still have to perform the actual read-back/absence operations.
+
+Claims have **no automatic expiry or takeover**. A crash or ambiguous remote
+outcome retains the claim instead of freeing capacity. A new process can read
+that obligation but cannot steal it through this API. Stale-writer-safe recovery
+and startup reconciliation remain unimplemented; a permanent lock is safe
+exclusion, not sufficient availability or a working TTL cleanup system. Before
+registration, every tool/job/event must use this journal and a recovery protocol
+must settle potentially live previous writers and ambiguous provider calls.
+
+The migration is present as source but its database declaration/capabilities are
+not enabled yet. Runtime registration, persistent-host adapter integration,
+reviewed approval routing/config, and Security acceptance remain release gates.
+A PostgreSQL concurrency fixture does not prove these lifecycle properties. SDK
+`state.set` remains an unconditional upsert and is not used as fake CAS.
 
 ## Spend, lifetime and automatic cleanup
 
@@ -222,11 +266,19 @@ IP/expiry read-back and revocation; first-401 abort; 403 handling; stale/replaye
 self-attributed or foreign approval; current membership and positive board-origin
 audit evidence. No fixture uses real credentials or Cloudflare mutations.
 
-Before release, add integration fixtures for authenticated handlers, company and
-project isolation, actual reservation/consumption concurrency, full teardown
-ordering, restart and ambiguous-create recovery, trusted runtime limits, forced
-expiry/issue-close cleanup, and secret hygiene across captured logs, plugin state,
-issue documents and every success/error tool result. Contract/protocol fixtures
+Access fixtures additionally cover current run/checkout ownership, company and
+project isolation, assignment/config changes during verification, expiry while
+awaiting the host, and fixed errors before secret/HTTP access. Isolated PostgreSQL
+fixtures use independent connections to exercise actual conditional reservation,
+journal-write and approval-burn contention, foreign-company isolation, persisted
+claims, lost commit replies and retained closed slots. CI requires these database
+fixtures rather than silently skipping them.
+
+Before release, add integration fixtures for the actual registered handlers,
+full teardown ordering, stale-writer-safe restart and ambiguous-create recovery,
+trusted runtime limits, forced expiry/issue-close cleanup, and secret hygiene
+across captured logs, plugin state, issue documents and every success/error tool
+result. Contract/protocol fixtures
 alone do not satisfy those acceptance tests. Security review precedes QA review;
 installation/configuration and live canary occur separately after merge.
 
