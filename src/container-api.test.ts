@@ -151,6 +151,60 @@ describe("container application protocol fixtures", () => {
   });
 });
 
+describe("operation identity and request exclusion", () => {
+  it("does not retarget deletion when the input changes during the ownership read", async () => {
+    const input = { ...env };
+    const { api, fetch } = fixture([envelope(app), envelope({}), absent(), inventory()]);
+    const original = fetch.getMockImplementation()!;
+    fetch.mockImplementation(async (url, init) => {
+      const response = await original(url, init);
+      if (init?.method === "GET") input.applicationId = "foreign-application";
+      return response;
+    });
+    await expect(api.deleteAndVerify(input)).resolves.toBeUndefined();
+    expect(fetch.mock.calls[1]![0].endsWith(`/applications/${env.applicationId}`)).toBe(true);
+    expect(fetch.mock.calls.every(([url]) => !url.includes("foreign-application"))).toBe(true);
+  });
+
+  it("captures create identity before the journal callback yields", async () => {
+    const input = { ...newEnv };
+    const { api } = fixture([envelope(app), envelope(app)]);
+    await expect(api.create(input, env.image, async () => {
+      input.namespaceId = "foreign-namespace";
+      input.image = `docker.io/cloudflare/sandbox@sha256:${"c".repeat(64)}`;
+    })).resolves.toBe(env.applicationId);
+  });
+
+  it("refuses overlapping requests while the first response body is pending, then honors its 401", async () => {
+    let release!: (response: Response) => void;
+    const fetch = vi.fn(() => new Promise<Response>((resolve) => { release = resolve; }));
+    const session = new ContainerApiSession();
+    const api = new ContainerApplicationApi(fetch, internalToken, env.accountId, session);
+    const first = api.readOwned(env);
+    const second = new ContainerApplicationApi(fetch, internalToken, env.accountId, session);
+    await expect(second.readOwned(env)).rejects.toMatchObject({ code: "operation_in_progress" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    release(new Response(internalToken, { status: 401 }));
+    await expect(first).rejects.toMatchObject({ code: "authentication_failed" });
+    await expect(second.readOwned(env)).rejects.toMatchObject({ code: "authentication_failed" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds request exclusion through response parsing, not only fetch", async () => {
+    let release!: (text: string) => void;
+    const response = envelope(app);
+    vi.spyOn(response, "text").mockImplementation(() => new Promise<string>((resolve) => { release = resolve; }));
+    const { api, fetch } = fixture([response]);
+    const first = api.readOwned(env);
+    // Let the response reach its asynchronous body reader.
+    await Promise.resolve(); await Promise.resolve();
+    await expect(api.readOwned(env)).rejects.toMatchObject({ code: "operation_in_progress" });
+    release(JSON.stringify({ success: true, result: app }));
+    await expect(first).resolves.toEqual({ id: env.applicationId });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("sanitized failures and first-401 circuit breaker", () => {
   it("aborts all subsequent calls across credentials on the first 401", async () => {
     const { api, fetch, session } = fixture([new Response(internalToken, { status: 401 })]);

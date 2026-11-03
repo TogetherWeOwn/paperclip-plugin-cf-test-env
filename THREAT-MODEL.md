@@ -101,6 +101,15 @@ Implemented primitives:
   enumerable object properties. It attempts revocation in `finally` and checks
   GET absence before recording revocation. A failed journal or uncertain
   revocation preserves a recovery obligation.
+- Credential purpose, environment identity, CIDRs and recovery callbacks are
+  captured before asynchronous preflight. Each application operation captures its
+  own validated identity before yielding: later caller mutation cannot retarget
+  a DELETE, a read-back or the original deployment cutoff.
+- Broker-issued callback clients check the verified token expiry and original
+  deployment cutoff before every request. Cleanup can run after env expiry, but
+  only within its own verified credential lifetime. The callback client closes
+  before revocation starts, including callback failure. A retained client cannot
+  start later requests; invalid or backwards clocks refuse.
 
 Required integration: enforce ownership/approval and single-use consumption
 before minting or application calls; forbid replacement/overlapping rollout;
@@ -207,6 +216,14 @@ exclusion, not sufficient availability or a working TTL cleanup system. Before
 registration, every tool/job/event must use this journal and a recovery protocol
 must settle potentially live previous writers and ambiguous provider calls.
 
+A per-request journal read or time check is not provider-side fencing: a process
+can pause after checking, and the provider can accept a request before its response
+is lost. Database CAS, callback closure and credential expiry checks do not cancel
+already dispatched requests or prove an old process cannot reach its bootstrap
+credential. No recovery API may turn an inventory scan, a lease timeout or a
+permanent claim into permission to resume creates. The stale-writer protocol must
+settle those cases across process/host RPC boundaries before takeover is enabled.
+
 The migration is present as source but its database declaration/capabilities are
 not enabled yet. Runtime registration, persistent-host adapter integration,
 reviewed approval routing/config, and Security acceptance remain release gates.
@@ -244,8 +261,12 @@ absence, silently extending the authorized window or relaxing the spend scope.
   diagnostic strings must not cross the tool/log/card boundary.
 - One shared lifecycle session stops all further Cloudflare calls on the first
   401, including revocation and rollback. A 403 is a step failure, not a dead
-  credential. Concurrent lifecycle calls must be serialized before relying on
-  this session-wide abort guarantee.
+  credential. The session refuses overlapping bootstrap/application requests and
+  holds exclusion through response parsing; it does not queue calls behind a
+  possible 401. Detached application work prevents a concurrent revocation receipt
+  and causes lifecycle failure with retained recovery intent. This is process-local
+  request exclusion, not cross-process operation fencing; all lifecycle entrypoints
+  must still use durable claims.
 - Network failure, missing acknowledged ID, failed persistence, partial create,
   or failed absence verification leaves recovery work; it is not successful
   teardown. Token intent must be durable before POST, including ambiguous mints.

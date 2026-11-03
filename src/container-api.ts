@@ -9,7 +9,7 @@ import {
 
 export class ContainerApiError extends Error {
   constructor(
-    readonly code: "authentication_failed" | "cloudflare_failed" | "invalid_response" | "transport_failed" | "cleanup_unverified" | "journal_failed",
+    readonly code: "authentication_failed" | "cloudflare_failed" | "invalid_response" | "transport_failed" | "cleanup_unverified" | "journal_failed" | "operation_in_progress" | "capability_expired",
     readonly status?: number,
   ) {
     super({
@@ -19,6 +19,8 @@ export class ContainerApiError extends Error {
       transport_failed: "Container API transport failed; remote outcome may be ambiguous.",
       cleanup_unverified: "Container application absence is not verified; cleanup state must be retained.",
       journal_failed: "Container application journal update failed; recovery is required.",
+      operation_in_progress: "Container API request is already in progress; no overlapping call is authorized.",
+      capability_expired: "Container application capability has closed or expired.",
     }[code]);
     this.name = "ContainerApiError";
   }
@@ -27,6 +29,16 @@ export class ContainerApiError extends Error {
 /** Share across all credentials in one lifecycle attempt, including revocation. */
 export class ContainerApiSession {
   #authenticationFailed = false;
+  #inFlight = false;
+
+  /** No queue: a pending request can still fail authentication or be ambiguous. */
+  async request<T>(run: () => Promise<T>): Promise<T> {
+    this.assertCallable();
+    if (this.#inFlight) throw new ContainerApiError("operation_in_progress");
+    this.#inFlight = true;
+    try { return await run(); }
+    finally { this.#inFlight = false; }
+  }
 
   get authenticationFailed(): boolean {
     return this.#authenticationFailed;
@@ -61,8 +73,9 @@ export class ContainerApplicationApi {
   #fetch: FetchImpl;
   #session: ContainerApiSession;
   #accountId: string;
+  #assertCurrent: () => void;
 
-  constructor(fetchImpl: FetchImpl, token: string, accountId: string, session: ContainerApiSession) {
+  constructor(fetchImpl: FetchImpl, token: string, accountId: string, session: ContainerApiSession, assertCurrent: () => void = () => undefined) {
     if (!/^[a-f0-9]{32}$/.test(accountId) || typeof token !== "string" || !token || /[\r\n]/.test(token)) {
       throw new ContainerApiError("invalid_response");
     }
@@ -70,15 +83,24 @@ export class ContainerApplicationApi {
     this.#token = token;
     this.#accountId = accountId;
     this.#session = session;
+    this.#assertCurrent = assertCurrent;
   }
 
-  private assertAccount(env: ContainerIdentity): void {
-    assertContainerIdentity(env);
-    if (env.accountId !== this.#accountId) throw new ContainerApiError("invalid_response");
+  private assertAccount(env: ContainerIdentity): ContainerIdentity {
+    const captured = { ...env };
+    assertContainerIdentity(captured);
+    if (captured.accountId !== this.#accountId) throw new ContainerApiError("invalid_response");
+    return captured;
   }
 
   private async request(method: "GET" | "POST" | "DELETE", suffix: string, body?: unknown, allowAbsent = false): Promise<Envelope | null> {
-    this.#session.assertCallable();
+    return this.#session.request(() => {
+      this.#assertCurrent();
+      return this.requestOnce(method, suffix, body, allowAbsent);
+    });
+  }
+
+  private async requestOnce(method: "GET" | "POST" | "DELETE", suffix: string, body?: unknown, allowAbsent = false): Promise<Envelope | null> {
     let response: Response;
     try {
       response = await this.#fetch(`https://api.cloudflare.com/client/v4/accounts/${this.#accountId}/containers/applications${suffix}`, {
@@ -110,7 +132,7 @@ export class ContainerApplicationApi {
   }
 
   private async readApplication(env: ContainerIdentity): Promise<(Record<string, unknown> & { id: string }) | null> {
-    this.assertAccount(env);
+    env = this.assertAccount(env);
     if (!env.applicationId) throw new ContainerApiError("invalid_response");
     const response = await this.request("GET", `/${env.applicationId}`, undefined, true);
     if (response === null) return null;
@@ -126,7 +148,7 @@ export class ContainerApplicationApi {
 
   /** Persist the acknowledged ID before cap validation, even on an unsafe read-back. */
   async create(env: ContainerIdentity, approvedImage: string, recordApplication: (id: string) => Promise<void>): Promise<string> {
-    this.assertAccount(env);
+    env = this.assertAccount(env);
     if (env.applicationId) throw new ContainerApiError("invalid_response");
     const body = buildContainerApplication(env, approvedImage);
     const response = await this.request("POST", "", body);
@@ -150,7 +172,7 @@ export class ContainerApplicationApi {
    * namespace (or vice versa) is a conflict, never an adopted cleanup target.
    */
   async findOwned(env: ContainerIdentity): Promise<string[]> {
-    this.assertAccount(env);
+    env = this.assertAccount(env);
     const ids: string[] = [];
     const seen = new Set<string>();
     let pageToken: string | undefined;
@@ -189,6 +211,7 @@ export class ContainerApplicationApi {
 
   /** Application first; the lifecycle caller must not delete its Worker on failure. */
   async deleteAndVerify(env: ContainerIdentity): Promise<void> {
+    env = this.assertAccount(env);
     const existing = await this.readOwned(env);
     if (existing !== null) await this.request("DELETE", `/${env.applicationId}`, undefined, true);
     if (await this.readOwned(env) !== null || (await this.findOwned(env)).length !== 0) {

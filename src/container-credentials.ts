@@ -50,7 +50,7 @@ export function containerTokenRequest(env: ContainerIdentity, groupId: string, e
   });
 }
 
-export function assertInternalContainerToken(actual: unknown, id: string, expected: TokenRequest, nowMs: number): void {
+export function assertInternalContainerToken(actual: unknown, id: string, expected: TokenRequest, nowMs: number): asserts actual is Record<string, unknown> & { expires_on: string } {
   const fail = (): never => { throw new ContainerCredentialError("verification_failed"); };
   if (!Number.isFinite(nowMs) || !record(actual) || actual.id !== id || actual.status !== "active" || actual.name !== expected.name
     || typeof actual.expires_on !== "string" || typeof actual.not_before !== "string"
@@ -95,7 +95,10 @@ export class ContainerCredentialBroker {
   }
 
   private async request(method: "GET" | "POST" | "DELETE", suffix: string, body?: unknown, allowAbsent = false): Promise<unknown> {
-    this.#session.assertCallable();
+    return this.#session.request(() => this.requestOnce(method, suffix, body, allowAbsent));
+  }
+
+  private async requestOnce(method: "GET" | "POST" | "DELETE", suffix: string, body?: unknown, allowAbsent = false): Promise<unknown> {
     let response: Response;
     try {
       response = await this.#fetch(`https://api.cloudflare.com/client/v4/accounts/${this.#accountId}/tokens${suffix}`, {
@@ -131,19 +134,31 @@ export class ContainerCredentialBroker {
     env: ContainerIdentity; groupId: string; egressCidrs: string[]; purpose: "deploy" | "cleanup";
     journal: ContainerCredentialJournal;
   }, run: (api: ContainerApplicationApi) => Promise<T>): Promise<T> {
-    const expected = containerTokenRequest(opts.env, opts.groupId, opts.egressCidrs, this.#now(), opts.purpose);
-    if (opts.env.accountId !== this.#accountId) throw new ContainerCredentialError("invalid_config");
+    const env = { ...opts.env };
+    const { groupId, purpose } = opts;
+    if (!Array.isArray(opts.egressCidrs) || !opts.journal
+      || [opts.journal.begin, opts.journal.acknowledged, opts.journal.revoked].some((write) => typeof write !== "function")) {
+      throw new ContainerCredentialError("invalid_config");
+    }
+    const expected = containerTokenRequest(env, groupId, [...opts.egressCidrs], this.#now(), purpose);
+    if (env.accountId !== this.#accountId) throw new ContainerCredentialError("invalid_config");
+    const journal: ContainerCredentialJournal = {
+      begin: opts.journal.begin.bind(opts.journal),
+      acknowledged: opts.journal.acknowledged.bind(opts.journal),
+      revoked: opts.journal.revoked.bind(opts.journal),
+    };
     const groups = await this.request("GET", "/permission_groups");
-    const matches = Array.isArray(groups) ? groups.filter((group) => record(group) && group.id === opts.groupId) : [];
+    const matches = Array.isArray(groups) ? groups.filter((group) => record(group) && group.id === groupId) : [];
     const group = matches[0];
     if (matches.length !== 1 || !record(group) || group.name !== CONTAINERS_GROUP_NAME || group.is_selectable !== true
       || !Array.isArray(group.scopes) || group.scopes.length !== 1 || group.scopes[0] !== ACCOUNT_RESOURCE) {
       throw new ContainerCredentialError("permission_unavailable");
     }
-    await this.journal(() => opts.journal.begin(expected.name, expected.expires_on));
+    await this.journal(() => journal.begin(expected.name, expected.expires_on));
     let id: string | undefined;
+    let open = true;
     try {
-      if (opts.purpose === "deploy") assertContainerActive(opts.env, this.#now());
+      if (purpose === "deploy") assertContainerActive(env, this.#now());
       if (!Number.isFinite(this.#now()) || this.#now() >= Date.parse(expected.expires_on)) {
         throw new ContainerCredentialError("verification_failed");
       }
@@ -152,20 +167,30 @@ export class ContainerCredentialBroker {
         throw new ContainerCredentialError("verification_failed");
       }
       id = minted.id;
-      await this.journal(() => opts.journal.acknowledged(id!));
+      await this.journal(() => journal.acknowledged(id!));
       if (typeof minted.value !== "string" || !minted.value || minted.value.length > 4096 || /[\r\n]/.test(minted.value)) {
         throw new ContainerCredentialError("verification_failed");
       }
       const stored = await this.request("GET", `/${id}`);
       assertInternalContainerToken(stored, id, expected, this.#now());
-      if (opts.purpose === "deploy") assertContainerActive(opts.env, this.#now());
-      return await run(new ContainerApplicationApi(this.#fetch, minted.value, this.#accountId, this.#session));
+      if (purpose === "deploy") assertContainerActive(env, this.#now());
+      const expiresMs = Date.parse(stored.expires_on);
+      const assertCurrent = () => {
+        const time = this.#now();
+        if (!open || !Number.isFinite(time) || time < Date.parse(expected.not_before) || time >= expiresMs) {
+          throw new ContainerApiError("capability_expired");
+        }
+        if (purpose === "deploy") assertContainerActive(env, time);
+      };
+      return await run(new ContainerApplicationApi(this.#fetch, minted.value, this.#accountId, this.#session, assertCurrent));
     } catch (err) {
       if (err instanceof ContainerApiError || err instanceof ContainerCredentialError || err instanceof ContainerRefusal) throw err;
       throw new ContainerCredentialError("operation_failed");
     } finally {
+      open = false;
       // A 401 forbids even cleanup calls in this attempt; the durable ID remains.
-      if (id && !this.#session.authenticationFailed) await this.revokeAndVerify(id, opts.journal);
+      // An outstanding detached request also prevents a false revocation receipt.
+      if (id && !this.#session.authenticationFailed) await this.revokeAndVerify(id, journal);
     }
   }
 }

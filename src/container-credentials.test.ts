@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ContainerApiSession } from "./container-api.js";
+import { ContainerApiSession, type ContainerApplicationApi } from "./container-api.js";
 import { type ContainerIdentity } from "./container-contract.js";
 import {
   assertInternalContainerToken, CONTAINERS_GROUP_NAME, ContainerCredentialBroker, ContainerCredentialError,
@@ -220,6 +220,125 @@ describe("in-memory credential lifecycle", () => {
     expect(failure).toBeInstanceOf(Error);
     secretFree(failure); secretFree(f.events);
     expect((failure as Error).cause).toBeUndefined();
+  });
+
+  it("closes the callback client before returning, even when retained", async () => {
+    const f = fixture([...mintSequence(), ...revokeSequence()]);
+    let retained!: ContainerApplicationApi;
+    await f.broker.withApplicationApi(f.opts, async (api) => { retained = api; });
+    await expect(retained.readOwned({ ...env, applicationId: "app" })).rejects.toMatchObject({ code: "capability_expired" });
+    expect(f.fetch).toHaveBeenCalledTimes(5);
+  });
+
+  it.each(["deploy", "cleanup"] as const)("checks the verified credential expiry on every %s application request", async (purpose) => {
+    let current = now;
+    const f = fixture([
+      json([group]), json({ id: tokenId, value: internal }), json({ ...stored, expires_on: new Date(now + 1000).toISOString() }),
+      ...revokeSequence(),
+    ], () => current);
+    await expect(f.broker.withApplicationApi({ ...f.opts, purpose }, async (api) => {
+      current += 1000;
+      return api.readOwned({ ...env, applicationId: "app" });
+    })).rejects.toMatchObject({ code: "capability_expired" });
+    expect(f.fetch).toHaveBeenCalledTimes(5);
+    expect(f.journal.revoked).toHaveBeenCalledExactlyOnceWith(tokenId);
+  });
+
+  it("does not let mutable options turn deployment into post-cutoff cleanup", async () => {
+    const cutoff = Date.parse(env.expiresAt) - 300000;
+    let current = cutoff - 1000;
+    const expected = containerTokenRequest(env, groupId, cidrs, current, "deploy");
+    const f = fixture([json([group]), json({ id: tokenId, value: internal }), json({ ...expected, id: tokenId, status: "active" }), ...revokeSequence()], () => current);
+    const opts = { ...f.opts, env: { ...env }, purpose: "deploy" as "deploy" | "cleanup" };
+    f.journal.begin = async () => { current = cutoff; opts.purpose = "cleanup"; };
+    const run = vi.fn();
+    await expect(f.broker.withApplicationApi(opts, run)).rejects.toMatchObject({ code: "expired" });
+    expect(run).not.toHaveBeenCalled();
+    expect(f.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("captures recovery callbacks before the intent write awaits", async () => {
+    const f = fixture([...mintSequence(), ...revokeSequence()]);
+    const acknowledged = f.journal.acknowledged;
+    const revoked = f.journal.revoked;
+    f.journal.begin = async () => {
+      f.journal.acknowledged = vi.fn(async () => undefined);
+      f.journal.revoked = vi.fn(async () => undefined);
+    };
+    await f.broker.withApplicationApi(f.opts, async () => undefined);
+    expect(acknowledged).toHaveBeenCalledExactlyOnceWith(tokenId);
+    expect(revoked).toHaveBeenCalledExactlyOnceWith(tokenId);
+  });
+
+  it("rechecks the original environment cutoff inside the callback before each request", async () => {
+    const cutoff = Date.parse(env.expiresAt) - 300000;
+    let current = cutoff - 1000;
+    const expected = containerTokenRequest(env, groupId, cidrs, current, "deploy");
+    const f = fixture([json([group]), json({ id: tokenId, value: internal }), json({ ...expected, id: tokenId, status: "active" }), ...revokeSequence()], () => current);
+    const opts = { ...f.opts, env: { ...env } };
+    await expect(f.broker.withApplicationApi(opts, async (api) => {
+      current = cutoff;
+      opts.env.expiresAt = "2026-11-03T15:01:00Z";
+      return api.readOwned({ ...env, applicationId: "app" });
+    })).rejects.toMatchObject({ code: "expired" });
+    expect(f.fetch).toHaveBeenCalledTimes(5);
+  });
+
+  it("allows cleanup application calls after environment expiry within their own credential window", async () => {
+    const current = Date.parse(env.expiresAt) + 1000;
+    const expected = containerTokenRequest(env, groupId, cidrs, current, "cleanup");
+    const f = fixture([
+      json([group]), json({ id: tokenId, value: internal }), json({ ...expected, id: tokenId, status: "active" }),
+      missing(), ...revokeSequence(),
+    ], () => current);
+    await expect(f.broker.withApplicationApi({ ...f.opts, purpose: "cleanup" }, (api) => api.readOwned({ ...env, applicationId: "app" }))).resolves.toBeNull();
+    expect(f.journal.revoked).toHaveBeenCalledExactlyOnceWith(tokenId);
+  });
+
+  it.each([NaN, Infinity, now - 1])("refuses invalid or backwards time inside the callback: %s", async (time) => {
+    let current = now;
+    const f = fixture([...mintSequence(), ...revokeSequence()], () => current);
+    await expect(f.broker.withApplicationApi(f.opts, async (api) => {
+      current = time;
+      return api.readOwned({ ...env, applicationId: "app" });
+    })).rejects.toMatchObject({ code: "capability_expired" });
+    expect(f.fetch).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not report success or revocation while detached application work is unresolved", async () => {
+    const f = fixture(mintSequence());
+    const original = f.fetch.getMockImplementation()!;
+    let release!: (response: Response) => void;
+    f.fetch.mockImplementation((url, init) => url.includes("/containers/")
+      ? new Promise<Response>((resolve) => { release = resolve; }) : original(url, init));
+    let detached!: Promise<unknown>;
+    let retained!: ContainerApplicationApi;
+    await expect(f.broker.withApplicationApi(f.opts, async (api) => {
+      retained = api;
+      detached = api.readOwned({ ...env, applicationId: "app" });
+    })).rejects.toMatchObject({ code: "operation_in_progress" });
+    expect(f.journal.revoked).not.toHaveBeenCalled();
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+    release(missing());
+    await expect(detached).resolves.toBeNull();
+    await expect(retained.readOwned({ ...env, applicationId: "app" })).rejects.toMatchObject({ code: "capability_expired" });
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("blocks bootstrap revocation while an internal-token request can still return 401", async () => {
+    const f = fixture(mintSequence());
+    const original = f.fetch.getMockImplementation()!;
+    let release!: (response: Response) => void;
+    f.fetch.mockImplementation((url, init) => url.includes("/containers/")
+      ? new Promise<Response>((resolve) => { release = resolve; }) : original(url, init));
+    await expect(f.broker.withApplicationApi(f.opts, async (api) => {
+      const pending = api.readOwned({ ...env, applicationId: "app" });
+      await expect(f.broker.revokeAndVerify(tokenId, f.journal)).rejects.toMatchObject({ code: "operation_in_progress" });
+      release(new Response(internal, { status: 401 }));
+      return pending;
+    })).rejects.toMatchObject({ code: "authentication_failed" });
+    expect(f.journal.revoked).not.toHaveBeenCalled();
+    expect(f.fetch).toHaveBeenCalledTimes(4);
   });
 
   it("sanitizes unexpected application callback failures before revoking", async () => {
