@@ -87,8 +87,72 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
 
 ```sh
 npm ci
-npm run check   # typecheck, tests, build
+npm run check   # typecheck, tests, build (SQL fixtures skip without a test DB)
 ```
+
+The container broker is an incomplete, unregistered implementation; see
+[`THREAT-MODEL.md`](THREAT-MODEL.md). Its coordination tests use real PostgreSQL,
+not an in-memory upsert/CAS mock. To include them locally, start an isolated
+PostgreSQL instance containing a database named `cf_broker_test`, then run:
+
+```sh
+CF_BROKER_TEST_DATABASE_URL=postgres://test_user@127.0.0.1:5432/cf_broker_test \
+CF_BROKER_REQUIRE_DATABASE_TESTS=1 npm run check
+```
+
+Use **only a disposable local test cluster**. The fixture creates the plugin's
+schema/table and cleans up its own test rows. It rejects non-loopback hosts,
+other database names, URL query parameters and fragments (including connection
+host/database overrides). The test driver is a development dependency; production
+code uses only the host's capability-scoped `ctx.db` interface. CI supplies an
+isolated PostgreSQL service and requires the database fixtures, so a missing test
+connection cannot silently pass there. No fixture calls Cloudflare.
+
+The source migration is not yet enabled in the manifest: no database capabilities,
+container tool registrations, live plugin migration or configuration changes are
+introduced by these foundations.
+
+### Proposed container tools: unknown outcomes
+
+`provision_container`, `deploy_container` and destructive `teardown_container`
+remain unregistered. They must not return an account-wide token or caller-writable
+Worker credential. See the threat model for their strict inputs and release gates.
+
+If token mint, Worker upload or application create has an unknown outcome, the
+selected behavior is **permanent env quarantine and human cleanup**, not automatic
+recovery or reuse. The retained account slot and claim cannot be released, even
+by human acknowledgement or inventory absence. Unknown creates may commit later;
+**automatic verified teardown by T+3h is not promised for that path**. Ordinary
+paths still require verified automatic teardown and the original spend controls.
+Security must explicitly accept this residual before release.
+
+The implemented notification adapter prepares an `Operator step:` confirmation
+naming the env, resource prefix, known IDs (never token values) and conservative
+create-call inspection targets. It uses a separately configured operator-owned
+cleanup inbox, not the possibly closed env source issue. Host idempotency retries
+only notification; accepting the card does not prove terminal settlement or free
+capacity. Missing/invalid operator or inbox configuration fails closed.
+
+An unregistered application coordinator now composes the journal, current caller,
+independent approval and injected HTTP clients: mint/create/revoke write-ahead
+receipts precede dispatch, acknowledged IDs precede further calls, and unknown
+mint/create outcomes permanently freeze and notify. A credential-free observer
+can freeze interrupted claims and retry notices, never replay a create. Settled
+ordinary failures retain a separate `cleanup_required` claim so restart cannot
+silently apply the unknown-create exception to a definitive refusal or unsafe cap.
+This marker is not teardown proof or permission to resume mutations.
+
+The application coordinator fetches independent Worker evidence before token
+preflight/mint and again after mint, before application creation: immutable script
+tag, pinned version/binding, fully scanned namespace inventory and latest serving
+deployment. These are point-in-time checks, not trusted-source attestation or
+provider-side fencing. They use the existing private bootstrap credential; missing
+permissions fail closed rather than authorizing another credential or wider grants.
+
+These remain **non-operational components**, not registered tools or scheduled
+jobs. Worker upload/source attestation, ordinary automatic cleanup, reviewed
+runtime/image, all-in spend controls and handler integration/acceptance still need
+implementation. No live cleanup inbox or plugin configuration is created here.
 
 ## License
 

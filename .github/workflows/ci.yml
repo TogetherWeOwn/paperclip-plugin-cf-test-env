@@ -20,6 +20,23 @@ jobs:
     name: check
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: cf_broker_test
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: cf_broker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cf_broker_test -d cf_broker_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CF_BROKER_TEST_DATABASE_URL: postgres://cf_broker_test:fixture-only@127.0.0.1:5432/cf_broker_test
+      CF_BROKER_REQUIRE_DATABASE_TESTS: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
