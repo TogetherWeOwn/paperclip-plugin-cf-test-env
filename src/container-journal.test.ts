@@ -357,6 +357,123 @@ describe.skipIf(!databaseUrl)("PostgreSQL container reservation and one-shot con
     expect((await journal.finish(snapshot, input.attemptId, "closed")).claim).toBeNull();
   });
 
+  it.each(["remote_outcome_unknown", "journal_outcome_unknown", "interrupted_attempt"] as const)("durably quarantines %s without releasing or stealing the claim", async (reason) => {
+    const before = await journal.reserve(reservation(), "provision");
+    const snapshot = await other.quarantine(before, reason);
+    expect(snapshot.status).toBe("uncertain");
+    expect(snapshot.claim).toEqual(before.claim);
+    expect(snapshot.reservation).toEqual(before.reservation);
+    expect(snapshot.facts).toEqual([{ kind: "quarantined", reason }]);
+    expect(await journal.read(before.reservation.accountId, before.reservation.companyId)).toEqual(snapshot);
+    await expect(journal.reserve(before.reservation, "reuse")).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("freezes a claim before ownership IDs are known and rejects the predecessor's late receipt", async () => {
+    const before = await journal.reserve(reservation(), "provision");
+    const snapshot = await other.quarantine(before, "interrupted_attempt");
+    const late = { kind: "worker_acknowledged", workerTag: "tag", namespaceId: "namespace", versionId: "version" } as const;
+    await expect(journal.append(before, "provision", late)).rejects.toMatchObject({ code: "conflict" });
+    await expect(journal.append(snapshot, "provision", late)).rejects.toMatchObject({ code: "conflict" });
+    await expect(journal.finish(snapshot, "provision", "ready")).rejects.toMatchObject({ code: "conflict" });
+    expect(await journal.read(before.reservation.accountId, before.reservation.companyId)).toEqual(snapshot);
+  });
+
+  it("keeps consent burned and refuses new approvals, attempts, absence facts and closure after quarantine", async () => {
+    let snapshot = await ready(journal);
+    const { pin, input } = approvalFixture(snapshot);
+    snapshot = await journal.pinApproval(snapshot, input.operation, pin);
+    snapshot = await journal.beginApproved(snapshot, input, () => nowMs);
+    const before = structuredClone(snapshot);
+    snapshot = await journal.quarantine(snapshot, "remote_outcome_unknown");
+    expect(snapshot.burnedInteractionIds).toEqual([pin.interactionId]);
+    expect(snapshot.approval).toEqual(before.approval);
+    for (const resource of ["application", "worker", "tokens"] as const) {
+      await expect(journal.append(snapshot, input.attemptId, { kind: "absence_verified", resource })).rejects.toMatchObject({ code: "conflict" });
+    }
+    await expect(journal.finish(snapshot, input.attemptId, "closed")).rejects.toMatchObject({ code: "conflict" });
+    const next = approvalFixture(snapshot);
+    await expect(journal.pinApproval(snapshot, next.input.operation, next.pin)).rejects.toMatchObject({ code: "conflict" });
+    await expect(journal.beginApproved(snapshot, next.input, () => nowMs)).rejects.toMatchObject({ code: "approval_required" });
+    expect(await other.read(snapshot.reservation.accountId, snapshot.reservation.companyId)).toEqual(snapshot);
+  });
+
+  it("retains token and application recovery obligations across quarantine and restart", async () => {
+    let snapshot = await ready(journal);
+    const { pin, input } = approvalFixture(snapshot, "deploy_container");
+    snapshot = await journal.pinApproval(snapshot, input.operation, pin);
+    snapshot = await journal.beginApproved(snapshot, input, () => nowMs);
+    snapshot = await journal.append(snapshot, input.attemptId, { kind: "token_intent", name: `${snapshot.reservation.envId}-containers-g1`, expiresAt: "2026-11-03T12:10:00Z" });
+    snapshot = await journal.append(snapshot, input.attemptId, { kind: "token_acknowledged", id: "token" });
+    snapshot = await journal.append(snapshot, input.attemptId, { kind: "application_intent" });
+    const before = structuredClone(snapshot);
+    snapshot = await journal.quarantine(snapshot, "remote_outcome_unknown");
+    expect(snapshot.facts.slice(0, -1)).toEqual(before.facts);
+    expect(snapshot.claim).toEqual(before.claim);
+    expect(await new ContainerJournal(adapter(second)).read(snapshot.reservation.accountId, snapshot.reservation.companyId)).toEqual(snapshot);
+  });
+
+  it("does not treat a lost quarantine receipt as success or clear the committed obligation", async () => {
+    const before = await journal.reserve(reservation(), "provision");
+    const lost = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      await db.execute(sql, params);
+      throw new Error("DATABASE_SECRET_CANARY");
+    } });
+    await expect(lost.quarantine(before, "journal_outcome_unknown")).rejects.toThrow("Container journal unavailable; no remote operation is authorized.");
+    const stored = await other.read(before.reservation.accountId, before.reservation.companyId);
+    expect(stored?.status).toBe("uncertain");
+    expect(stored?.claim).toEqual(before.claim);
+    expect(JSON.stringify(stored)).not.toContain("DATABASE_SECRET_CANARY");
+  });
+
+  it("leaves the original claim recoverable if the quarantine write was denied", async () => {
+    const before = await journal.reserve(reservation(), "provision");
+    const denied = new ContainerJournal({ ...db, execute: async () => { throw new Error("DATABASE_SECRET_CANARY"); } });
+    await expect(denied.quarantine(before, "journal_outcome_unknown")).rejects.toMatchObject({ code: "unavailable" });
+    expect(await other.read(before.reservation.accountId, before.reservation.companyId)).toEqual(before);
+    const retry = await other.quarantine(before, "interrupted_attempt");
+    expect(retry.status).toBe("uncertain");
+  });
+
+  it("does not let a stale quarantine snapshot overwrite a newer journal fact", async () => {
+    const before = await journal.reserve(reservation(), "provision");
+    const updated = await other.append(before, "provision", { kind: "worker_acknowledged", workerTag: "tag", namespaceId: "namespace", versionId: "version" });
+    await expect(journal.quarantine(before, "interrupted_attempt")).rejects.toMatchObject({ code: "conflict" });
+    expect(await journal.read(before.reservation.accountId, before.reservation.companyId)).toEqual(updated);
+    expect((await journal.quarantine(updated, "interrupted_attempt")).facts).toHaveLength(2);
+  });
+
+  it("does not freeze an idle ready slot as an interrupted in-flight attempt", async () => {
+    const snapshot = await ready(journal);
+    await expect(journal.quarantine(snapshot, "interrupted_attempt")).rejects.toMatchObject({ code: "conflict" });
+    expect(await other.read(snapshot.reservation.accountId, snapshot.reservation.companyId)).toEqual(snapshot);
+  });
+
+  it("rejects invented uncertain status without its durable reason", async () => {
+    const snapshot = await journal.reserve(reservation(), "provision");
+    await first.query(`UPDATE ${table} SET document = jsonb_set(document, '{status}', '"uncertain"'::jsonb) WHERE account_id = $1`, [snapshot.reservation.accountId]);
+    await expect(other.read(snapshot.reservation.accountId, snapshot.reservation.companyId)).rejects.toMatchObject({ code: "invalid_journal" });
+  });
+
+  it("reserves the final fact slot for irreversible quarantine", async () => {
+    let snapshot = await ready(journal);
+    const { pin, input } = approvalFixture(snapshot);
+    snapshot = await journal.pinApproval(snapshot, input.operation, pin);
+    snapshot = await journal.beginApproved(snapshot, input, () => nowMs);
+    const facts = [...snapshot.facts, ...Array.from({ length: 510 }, () => ({ kind: "absence_verified", resource: "worker" }))];
+    await first.query(`UPDATE ${table} SET document = jsonb_set(document, '{facts}', $1::jsonb) WHERE account_id = $2`, [JSON.stringify(facts), snapshot.reservation.accountId]);
+    snapshot = (await other.read(snapshot.reservation.accountId, snapshot.reservation.companyId))!;
+    await expect(journal.append(snapshot, input.attemptId, { kind: "absence_verified", resource: "tokens" })).rejects.toMatchObject({ code: "invalid_journal" });
+    const frozen = await journal.quarantine(snapshot, "interrupted_attempt");
+    expect(frozen.facts).toHaveLength(512);
+    expect(frozen.status).toBe("uncertain");
+  });
+
+  it("cannot append a caller-supplied quarantine marker through the ordinary fact API", async () => {
+    const snapshot = await journal.reserve(reservation(), "provision");
+    await expect(journal.append(snapshot, "provision", { kind: "quarantined", reason: "interrupted_attempt" })).rejects.toMatchObject({ code: "invalid_journal" });
+    expect(await other.read(snapshot.reservation.accountId, snapshot.reservation.companyId)).toEqual(snapshot);
+  });
+
   it("rejects corrupt stored documents rather than repairing them permissively", async () => {
     const snapshot = await journal.reserve(reservation(), "provision");
     await first.query(`UPDATE ${table} SET document = jsonb_set(document, '{facts}', 'null'::jsonb) WHERE account_id = $1`, [snapshot.reservation.accountId]);

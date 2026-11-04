@@ -5,7 +5,8 @@
 **Work in progress; container tools are not registered.** The current change adds
 strict contracts, an application protocol client, an internal credential helper,
 an independent-approval evidence predicate, a PostgreSQL coordination journal,
-and current caller/checkout checks. It does not yet provide an operational
+current caller/checkout checks, irreversible quarantine, and an operator-notice
+adapter. It does not yet provide an operational
 container environment. The existing non-container tools and their
 behavior are unchanged.
 
@@ -220,11 +221,11 @@ lifecycle adapters still have to perform the actual read-back/absence operations
 
 Claims have **no automatic expiry or takeover**. A crash or ambiguous remote
 outcome retains the claim instead of freeing capacity. A new process can read
-that obligation but cannot steal it through this API. Stale-writer-safe recovery
-and startup reconciliation remain unimplemented; a permanent lock is safe
-exclusion, not sufficient availability or a working TTL cleanup system. Before
-registration, every tool/job/event must use this journal and a recovery protocol
-must settle potentially live previous writers and ambiguous provider calls.
+that obligation and irreversibly freeze it, but cannot steal it through this API.
+Startup reconciliation and lifecycle integration remain unimplemented; a permanent
+lock is safe exclusion, not sufficient availability or a working TTL cleanup
+system. Before registration, every tool/job/event must use the journal and route
+unknown outcomes to the quarantine-and-human-cleanup path below.
 
 A per-request journal read or time check is not provider-side fencing: a process
 can pause after checking, and the provider can accept a request before its response
@@ -234,18 +235,66 @@ credential. No recovery API may turn an inventory scan, a lease timeout or a
 permanent claim into permission to resume creates. The stale-writer protocol must
 settle those cases across process/host RPC boundaries before takeover is enabled.
 
-**Recovery feasibility gate:** inspection of the installed host/SDK and pinned
-provider schemas found no supported plugin-only way to quiesce predecessor
-writers or prove that an ambiguous mint, Worker upload or scheduled-application
-create will never commit. Worker crashes can drop responses while host handlers
-continue; the host has no durable epoch/dispatch ledger. A host-side ledger would
-still leave provider-accepted-unknown writes: the selected APIs supply no documented
-terminal cancellation/idempotency or maximum commit-latency guarantee. Bootstrap
-revocation or token expiry does not settle an already accepted request. Do not
-invent a delay, steal a claim, reuse a new session to escape quarantine, or call
-absence proof of terminal settlement. A source-backed recovery architecture is a
-release prerequisite; host-only fencing is not sufficient. No credential rotation
-or security/deadline/spend exception is authorized by this code.
+### Quarantine-and-human-cleanup residual
+
+Inspection of the installed host/SDK and pinned provider schemas found no
+supported plugin-only way to quiesce predecessor writers or prove that an
+ambiguous mint, Worker upload or scheduled-application create will never commit.
+Worker crashes can drop responses while host handlers continue; the host has no
+durable epoch/dispatch ledger. A host-side ledger would still leave
+provider-accepted-unknown writes: the selected APIs supply no documented terminal
+cancellation/idempotency or maximum commit-latency guarantee. Bootstrap revocation
+or token expiry does not settle an already accepted request.
+
+The selected product behavior accepts that residual: an unknown create freezes
+the env forever and requires human cleanup of resources that may appear later.
+**Automatic verified teardown by T+3h is not promised on that path.** This is not
+permission to relax ordinary verified teardown, runtime/spend controls, the
+service-side credential boundary or a deployment gate. Security must explicitly
+accept this residual in its review before release. That review has not occurred.
+
+Implemented journal behavior:
+
+- `quarantine` atomically changes a claimed slot to `uncertain` and appends one
+  fixed reason: remote outcome unknown, journal outcome unknown, or interrupted
+  attempt. It keeps the exact reservation, claim, credential/application facts,
+  approval and permanently burned interaction IDs. The final fact slot is reserved
+  for this marker.
+- A restart observer can freeze a claim, not acquire it. Stale conditional writes
+  lose to the frozen revision. Even the original claimant cannot append facts,
+  finish, close or record inventory absence after quarantine. The API has no
+  unquarantine or human-acknowledgement release method; the account slot remains
+  unavailable. This stops subsequent journal progression, not already dispatched
+  requests or a writer paused after its last check.
+- A lost quarantine-write receipt is failure, not success. A surviving original
+  claim remains a reconciliation obligation if that write did not commit. A
+  lifecycle must stop dispatch and re-read before attempting notification; this
+  integration is still required.
+
+The notification adapter reads the durable frozen record and reduces it to env,
+account, generation, resource prefix/names, known non-secret IDs and conservative
+create-call inspection targets. Earlier intents stay listed even after point-in-
+time absence or token revocation. It never includes token values, provider
+responses or arbitrary diagnostics. Ownership must be independently established
+before deletion: a prefix is not permission to delete a foreign resource.
+
+Delivery uses the supported host `requestConfirmation` with a stable idempotency
+key and exact-env custom target. It requires explicit reviewed operator user and
+cleanup-inbox issue configuration, current active non-viewer human membership,
+and a same-company nonterminal issue assigned only to that operator. The inbox
+must differ from the env source issue: a done/cancelled source must not expire the
+cleanup card. Missing config, foreign/closed/reassigned inboxes, capability denial,
+lost replies and mismatched receipts return a fixed notice error. Notification
+retries reuse the host idempotency key; they never retry a provider create. Human
+acceptance or rejection neither proves cleanup nor clears the frozen claim.
+
+Before release, startup preflight must validate that inbox, and every unknown
+create/interrupted attempt must durably freeze and deliver/retry the notice.
+Notification failure must remain visibly outstanding, not count as completed
+recovery. The adapter is not wired to lifecycle handlers yet and no live cleanup
+inbox or interaction has been created by these tests. Do not invent a finite
+settlement delay, steal a claim, use a new session to escape quarantine, or call
+absence proof of terminal settlement. No credential change is authorized.
 
 The migration is present as source but its database declaration/capabilities are
 not enabled yet. Runtime registration, persistent-host adapter integration,
@@ -255,8 +304,11 @@ A PostgreSQL concurrency fixture does not prove these lifecycle properties. SDK
 
 ## Spend, lifetime and automatic cleanup
 
-Release requirements remain: one instance, under $1 worst case within the
-approved four-hour window, and teardown by T+3h. Identity validation bounds the
+Ordinary-path release requirements remain: one instance, under $1 worst case
+within the approved four-hour window, and verified teardown by T+3h. An unknown
+create instead takes the explicit quarantine/human-cleanup residual above; it
+cannot claim automatic deadline compliance or terminal absence. Complete spend
+controls remain required, including idle billing. Identity validation bounds the
 absolute environment lifetime to three hours; new deployment work closes five
 minutes before that deadline. Reprovisioning/retry must not renew an existing env.
 Cleanup credentials may be minted after env expiry because token expiry does not
@@ -327,9 +379,17 @@ installed SDK additionally proves a caller timeout leaves its HTTP call unsettle
 new calls both before and after that reply. This fixture makes no real HTTP request
 and does not reproduce a host process crash or prove provider settlement.
 
+Quarantine fixtures additionally cover independent-connection freezing, retained
+claims/intents/consent, late stale writes, lost/denied receipts, immutable unknown
+outcomes and fixed reason validation. Injected-host notification fixtures cover
+operator routing, exact targets, idempotent retries, foreign/closed inboxes,
+current membership, policy mutation, sanitized errors and unchanged quarantine
+after human acknowledgement. These are not registered-handler or live delivery
+tests.
+
 Before release, add integration fixtures for the actual registered handlers,
-full teardown ordering, stale-writer-safe restart and ambiguous-create recovery,
-trusted runtime limits, forced expiry/issue-close cleanup, and secret hygiene
+full teardown ordering, restart quarantine and reliable operator escalation for
+ambiguous creates, trusted runtime limits, forced expiry/issue-close cleanup, and secret hygiene
 across captured logs, plugin state, issue documents and every success/error tool
 result. Contract/protocol fixtures
 alone do not satisfy those acceptance tests. Security review precedes QA review;

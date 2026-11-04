@@ -112,6 +112,33 @@ The source migration is not yet enabled in the manifest: no database capabilitie
 container tool registrations, live plugin migration or configuration changes are
 introduced by these foundations.
 
+### Proposed container tools: unknown outcomes
+
+`provision_container`, `deploy_container` and destructive `teardown_container`
+remain unregistered. They must not return an account-wide token or caller-writable
+Worker credential. See the threat model for their strict inputs and release gates.
+
+If token mint, Worker upload or application create has an unknown outcome, the
+selected behavior is **permanent env quarantine and human cleanup**, not automatic
+recovery or reuse. The retained account slot and claim cannot be released, even
+by human acknowledgement or inventory absence. Unknown creates may commit later;
+**automatic verified teardown by T+3h is not promised for that path**. Ordinary
+paths still require verified automatic teardown and the original spend controls.
+Security must explicitly accept this residual before release.
+
+The implemented notification adapter prepares an `Operator step:` confirmation
+naming the env, resource prefix, known IDs (never token values) and conservative
+create-call inspection targets. It uses a separately configured operator-owned
+cleanup inbox, not the possibly closed env source issue. Host idempotency retries
+only notification; accepting the card does not prove terminal settlement or free
+capacity. Missing/invalid operator or inbox configuration fails closed.
+
+These are journal and host-adapter primitives, **not operational tools**. Actual
+lifecycle dispatch, write-ahead intent, startup quarantine/notification retry,
+ordinary cleanup, reviewed runtime/image and all-in spend controls still need
+integration and acceptance tests. No live cleanup inbox or plugin configuration
+is created here.
+
 ## License
 
 MIT

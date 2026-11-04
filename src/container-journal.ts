@@ -14,6 +14,8 @@ type ApprovalHost = Pick<PluginContext, "issues" | "access" | "authorization">;
 export type ContainerReservation = Omit<ContainerIdentity, "workerTag" | "namespaceId" | "applicationId">;
 type Operation = "provision_container" | ContainerOperation;
 type Status = "reserved" | "ready" | "live" | "uncertain" | "closed";
+const quarantineReasons = ["remote_outcome_unknown", "journal_outcome_unknown", "interrupted_attempt"] as const;
+export type ContainerQuarantineReason = typeof quarantineReasons[number];
 
 export type ContainerJournalFact =
   | { kind: "worker_acknowledged"; workerTag: string; namespaceId: string; versionId: string }
@@ -22,7 +24,8 @@ export type ContainerJournalFact =
   | { kind: "token_intent"; name: string; expiresAt: string }
   | { kind: "token_acknowledged"; id: string }
   | { kind: "token_revoked"; id: string }
-  | { kind: "absence_verified"; resource: "application" | "worker" | "tokens" };
+  | { kind: "absence_verified"; resource: "application" | "worker" | "tokens" }
+  | { kind: "quarantined"; reason: ContainerQuarantineReason };
 
 interface JournalDocument {
   reservation: ContainerReservation;
@@ -104,6 +107,10 @@ function assertFact(value: unknown, reservation: ContainerReservation): asserts 
       exact(value, ["kind", "name", "expiresAt"]);
       if (value.name !== `${reservation.envId}-containers-g${reservation.generation}` || !validTime(value.expiresAt)) throw new ContainerJournalError("invalid_journal");
       return;
+    case "quarantined":
+      exact(value, ["kind", "reason"]);
+      if (!quarantineReasons.some((reason) => reason === value.reason)) throw new ContainerJournalError("invalid_journal");
+      return;
     case "absence_verified":
       exact(value, ["kind", "resource"]);
       if (!["application", "worker", "tokens"].includes(String(value.resource))) throw new ContainerJournalError("invalid_journal");
@@ -131,7 +138,8 @@ function credentialWork(facts: ContainerJournalFact[]) {
       if (!pending || pending.id !== fact.id) throw new ContainerJournalError("invalid_journal");
       pending = null;
     } else if (fact.kind === "absence_verified" && fact.resource === "tokens") {
-      // Complete verified inventory absence can settle an ambiguous mint too.
+      // Only a point-in-time inventory. An unknown mint must quarantine its
+      // claim instead; quarantined journals cannot append absence or close.
       pending = null;
       lastAbsence = index;
     }
@@ -148,6 +156,10 @@ function assertDocument(value: unknown): asserts value is JournalDocument {
     || !value.burnedInteractionIds.every(validId)
     || new Set(value.burnedInteractionIds).size !== value.burnedInteractionIds.length) throw new ContainerJournalError("invalid_journal");
   for (const fact of value.facts) assertFact(fact, value.reservation);
+  const quarantines = value.facts.filter((fact) => fact.kind === "quarantined");
+  if (value.status === "uncertain"
+    ? quarantines.length !== 1 || value.facts.at(-1) !== quarantines[0] || value.claim === null
+    : quarantines.length !== 0) throw new ContainerJournalError("invalid_journal");
   credentialWork(value.facts);
   if (value.claim !== null) {
     exact(value.claim, ["id", "operation"]);
@@ -176,6 +188,49 @@ function identity(snapshot: ContainerJournalSnapshot): ContainerIdentity {
   const worker = workers[0]!;
   return { ...snapshot.reservation, workerTag: worker.workerTag, namespaceId: worker.namespaceId,
     ...(applications[0] ? { applicationId: applications[0].id } : {}) };
+}
+
+export interface ContainerCleanupObligation {
+  companyId: string;
+  issueId: string;
+  accountId: string;
+  envId: string;
+  generation: number;
+  workerName: string;
+  applicationName: string;
+  expiresAt: string;
+  reason: ContainerQuarantineReason;
+  possibleUnknownCreates: ("worker_upload" | "application_create" | "token_mint")[];
+  workerTags: string[];
+  namespaceIds: string[];
+  applicationIds: string[];
+  tokenIds: string[];
+}
+
+/** Conservative inspection targets, not proof that any remote request has settled. */
+export function containerCleanupObligation(snapshot: ContainerJournalSnapshot): ContainerCleanupObligation {
+  const doc = document(snapshot);
+  const quarantine = doc.facts.at(-1);
+  if (doc.status !== "uncertain" || quarantine?.kind !== "quarantined") throw new ContainerJournalError("conflict");
+  const { companyId, issueId, accountId, envId, generation, workerName, applicationName, expiresAt } = doc.reservation;
+  const workers = doc.facts.filter((fact) => fact.kind === "worker_acknowledged");
+  const applications = doc.facts.filter((fact) => fact.kind === "application_acknowledged");
+  const tokens = doc.facts.filter((fact) => fact.kind === "token_acknowledged");
+  const possibleUnknownCreates: ContainerCleanupObligation["possibleUnknownCreates"] = [];
+  // Until dispatch integration exists a provisioning claim may have uploaded its
+  // Worker even without an acknowledged ID. Include all earlier intents as well:
+  // absence, expiry and revocation do not terminally settle an ambiguous create.
+  if (doc.claim?.operation === "provision_container" || workers.length) possibleUnknownCreates.push("worker_upload");
+  if (doc.facts.some((fact) => fact.kind === "application_intent")) possibleUnknownCreates.push("application_create");
+  if (doc.facts.some((fact) => fact.kind === "token_intent")) possibleUnknownCreates.push("token_mint");
+  return {
+    companyId, issueId, accountId, envId, generation, workerName, applicationName, expiresAt,
+    reason: quarantine.reason, possibleUnknownCreates,
+    workerTags: [...new Set(workers.map((fact) => fact.workerTag))],
+    namespaceIds: [...new Set(workers.map((fact) => fact.namespaceId))],
+    applicationIds: [...new Set(applications.map((fact) => fact.id))],
+    tokenIds: [...new Set(tokens.map((fact) => fact.id))],
+  };
 }
 
 /**
@@ -247,10 +302,23 @@ export class ContainerJournal {
     return { ...JSON.parse(encoded) as JournalDocument, revision: revision + 1 };
   }
 
+  /** Freeze only: an observer can quarantine an interrupted claim, never take it. */
+  async quarantine(snapshot: ContainerJournalSnapshot, reason: ContainerQuarantineReason): Promise<ContainerJournalSnapshot> {
+    const next = document(snapshot);
+    if (!next.claim || next.status === "closed" || next.status === "uncertain") throw new ContainerJournalError("conflict");
+    const fact: ContainerJournalFact = { kind: "quarantined", reason };
+    assertFact(fact, next.reservation);
+    next.status = "uncertain";
+    next.facts.push(fact);
+    return this.replace(snapshot, next);
+  }
+
   async append(snapshot: ContainerJournalSnapshot, attemptId: string, fact: ContainerJournalFact): Promise<ContainerJournalSnapshot> {
     const next = document(snapshot);
-    if (!next.claim || next.claim.id !== attemptId) throw new ContainerJournalError("conflict");
+    if (!next.claim || next.claim.id !== attemptId || next.status === "uncertain") throw new ContainerJournalError("conflict");
     assertFact(fact, next.reservation);
+    // Always leave room to persist the irreversible quarantine marker.
+    if (fact.kind === "quarantined" || next.facts.length >= MAX_FACTS - 1) throw new ContainerJournalError("invalid_journal");
     if (fact.kind.startsWith("token_") && (next.claim.operation === "provision_container"
       || next.approval?.operation !== next.claim.operation || !next.approval.pin.consumedAt
       || !next.burnedInteractionIds.includes(next.approval.pin.interactionId))) throw new ContainerJournalError("invalid_journal");
@@ -265,7 +333,7 @@ export class ContainerJournal {
   /** End a known attempt only; ambiguous remote outcomes retain their claim. */
   async finish(snapshot: ContainerJournalSnapshot, attemptId: string, status: "ready" | "live" | "closed"): Promise<ContainerJournalSnapshot> {
     const next = document(snapshot);
-    if (!next.claim || next.claim.id !== attemptId) throw new ContainerJournalError("conflict");
+    if (!next.claim || next.claim.id !== attemptId || next.status === "uncertain") throw new ContainerJournalError("conflict");
     const operation = next.claim.operation;
     if ((status === "ready" && operation !== "provision_container") || (status === "live" && operation !== "deploy_container")
       || (status === "closed" && operation !== "teardown_container") || !["ready", "live", "closed"].includes(status)) throw new ContainerJournalError("invalid_journal");
