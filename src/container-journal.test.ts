@@ -2,10 +2,12 @@ import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { containerApprovalDigest, type ContainerApprovalPin, type ContainerApprovalPolicy } from "./container-approval.js";
 import { CONTAINER_DATABASE_NAMESPACE, ContainerJournal, ContainerJournalError, type ContainerJournalSnapshot, type ContainerReservation } from "./container-journal.js";
 import type { ContainerIdentity, ContainerOperation } from "./container-contract.js";
+import { deployContainerApplication, reconcileContainerAttempt, type ContainerDeploymentPolicy } from "./container-lifecycle.js";
+import { CONTAINERS_GROUP_NAME, containerTokenRequest } from "./container-credentials.js";
 
 const databaseUrl = process.env.CF_BROKER_TEST_DATABASE_URL;
 if (process.env.CF_BROKER_REQUIRE_DATABASE_TESTS === "1" && !databaseUrl) throw new Error("An isolated broker test database is required.");
@@ -472,6 +474,470 @@ describe.skipIf(!databaseUrl)("PostgreSQL container reservation and one-shot con
     const snapshot = await journal.reserve(reservation(), "provision");
     await expect(journal.append(snapshot, "provision", { kind: "quarantined", reason: "interrupted_attempt" })).rejects.toMatchObject({ code: "invalid_journal" });
     expect(await other.read(snapshot.reservation.accountId, snapshot.reservation.companyId)).toEqual(snapshot);
+  });
+
+  async function deploymentFixture() {
+    let snapshot = await ready(journal);
+    const approval = approvalFixture(snapshot, "deploy_container");
+    snapshot = await journal.pinApproval(snapshot, approval.input.operation, approval.pin);
+    const env = { ...snapshot.reservation, workerTag: "tag", namespaceId: "namespace" };
+    const cleanup = { operatorUserId: "operator", cleanupIssueId: "cleanup-inbox" };
+    const deploymentPolicy: ContainerDeploymentPolicy = {
+      accountId: env.accountId, approvedImage: env.image, groupId: "b".repeat(32), egressCidrs: ["192.0.2.7/32"],
+      pluginVersion: version, approval: policy, cleanup,
+    };
+    const source = { id: env.issueId, companyId: env.companyId, projectId: env.projectId, assigneeAgentId: env.ownerAgentId, status: "in_progress", assigneeUserId: null };
+    const inbox = { id: cleanup.cleanupIssueId, companyId: env.companyId, status: "in_review", assigneeUserId: "operator", assigneeAgentId: null };
+    const host = {
+      ...approval.host,
+      config: { get: vi.fn(async () => ({ accountId: env.accountId, allowedProjectIds: [env.projectId] })) },
+      issues: {
+        ...approval.host.issues,
+        get: vi.fn(async (id: string) => id === env.issueId ? { ...source } : { ...inbox }),
+        assertCheckoutOwner: vi.fn(async () => ({ issueId: env.issueId, assigneeAgentId: env.ownerAgentId, checkoutRunId: "run", status: "in_progress" })),
+        requestConfirmation: vi.fn(async (issueId: string, input: Record<string, unknown>, companyId: string) => ({
+          ...input, id: "notice", issueId, companyId, kind: "request_confirmation", status: "pending",
+          requestedResolverPolicy: input.resolverPolicy, effectiveResolverPolicy: input.resolverPolicy,
+        })),
+      },
+      access: { members: { list: vi.fn(async () => ["board-user", "operator"].map((principalId) => ({
+        companyId: env.companyId, principalType: "user", principalId, status: "active", membershipRole: "member",
+      }))) } },
+    };
+    const tokenId = "c".repeat(32);
+    const json = (result: unknown) => Response.json({ success: true, result });
+    const app = { id: "app", name: env.applicationName, account_id: env.accountId, scheduling_policy: "default", instances: 0, max_instances: 1,
+      configuration: { image: env.image, instance_type: "lite" }, durable_objects: { namespace_id: env.namespaceId } };
+    const responses: (Response | Error)[] = [
+      json([{ id: deploymentPolicy.groupId, name: CONTAINERS_GROUP_NAME, is_selectable: true, scopes: ["com.cloudflare.api.account"] }]),
+      json({ id: tokenId, value: "INTERNAL_SECRET_CANARY" }),
+      json({ ...containerTokenRequest(env, deploymentPolicy.groupId, deploymentPolicy.egressCidrs, nowMs, "deploy"), id: tokenId, status: "active" }),
+      json({ ...app, metadata: "INTERNAL_SECRET_CANARY" }), json(app), json({}), new Response(null, { status: 404 }),
+    ];
+    const observed: ContainerJournalSnapshot[] = [];
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => {
+      observed.push((await other.read(env.accountId, env.companyId))!);
+      const response = responses.shift();
+      if (response instanceof Error) throw response;
+      if (!response) throw new Error("No live network in fixtures");
+      return response;
+    });
+    const deps = {
+      host: host as unknown as Parameters<typeof deployContainerApplication>[0]["host"], journal, fetch,
+      resolveBootstrap: vi.fn(async () => "BOOTSTRAP_SECRET_CANARY"), now: () => nowMs,
+    };
+    const run = { companyId: env.companyId, projectId: env.projectId, agentId: env.ownerAgentId, runId: "run" } as ToolRunContext;
+    const input = { envId: env.envId, image: env.image };
+    const invoke = () => deployContainerApplication(deps, run, input, deploymentPolicy);
+    const restart = () => reconcileContainerAttempt(deps.host, other, { accountId: env.accountId, companyId: env.companyId, policy: cleanup });
+    const read = () => other.read(env.accountId, env.companyId);
+    return { deps, host, source, inbox, snapshot, deploymentPolicy, run, input, env, app, tokenId, responses, observed, fetch, invoke, restart, read };
+  }
+
+  it("integrates approval burn, write-ahead mint/create/revoke, read-back and secret-free live receipt", async () => {
+    const f = await deploymentFixture();
+    const result = await f.invoke();
+    expect(result).toEqual({ envId: f.env.envId, applicationId: "app", expiresAt: f.env.expiresAt });
+    expect(f.observed[1]!.facts.at(-1)?.kind).toBe("token_intent");
+    expect(f.observed[3]!.facts.at(-1)?.kind).toBe("application_intent");
+    expect(f.observed[5]!.facts.at(-1)).toEqual({ kind: "token_revocation_intent", id: f.tokenId });
+    expect(f.observed.every((snapshot) => snapshot.claim?.operation === "deploy_container" && snapshot.burnedInteractionIds.length === 1)).toBe(true);
+    expect(await f.read()).toMatchObject({ status: "live", claim: null });
+    expect(f.fetch).toHaveBeenCalledTimes(7);
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+    expect(JSON.stringify({ result, journal: await f.read() })).not.toMatch(/INTERNAL_SECRET_CANARY|BOOTSTRAP_SECRET_CANARY/);
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(7);
+  });
+
+  it.each(["closed-inbox", "wrong-owner", "foreign-env", "foreign-image", "extra-input", "wrong-company", "terminal-issue", "wrong-checkout"])("refuses %s before credential resolution", async (stage) => {
+    const f = await deploymentFixture();
+    if (stage === "closed-inbox") f.inbox.status = "done";
+    if (stage === "wrong-owner") f.inbox.assigneeUserId = "foreign";
+    if (stage === "foreign-env") f.input.envId = "pct-abcdef12-654321";
+    if (stage === "foreign-image") f.input.image = `docker.io/cloudflare/sandbox@sha256:${"f".repeat(64)}`;
+    if (stage === "extra-input") Object.assign(f.input, { approved: true });
+    if (stage === "wrong-company") f.run.companyId = "foreign";
+    if (stage === "terminal-issue") f.source.status = "done";
+    if (stage === "wrong-checkout") f.host.issues.assertCheckoutOwner.mockResolvedValue({ issueId: f.env.issueId, assigneeAgentId: "foreign", checkoutRunId: "run", status: "in_progress" });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.deps.resolveBootstrap).not.toHaveBeenCalled();
+    expect(f.fetch).not.toHaveBeenCalled();
+    expect(await f.read()).toEqual(f.snapshot);
+  });
+
+  it("allows exactly one concurrent approved deployment with two database connections", async () => {
+    const f = await deploymentFixture();
+    const results = await Promise.allSettled([f.invoke(), deployContainerApplication({ ...f.deps, journal: other }, f.run, f.input, f.deploymentPolicy)]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(f.fetch).toHaveBeenCalledTimes(7);
+    expect((await f.read())?.status).toBe("live");
+  });
+
+  it.each(["mint", "create"])("freezes unknown %s and retries only operator notice on restart", async (stage) => {
+    const f = await deploymentFixture();
+    const index = stage === "mint" ? 1 : 3;
+    f.responses[index] = new Error("BOOTSTRAP_SECRET_CANARY INTERNAL_SECRET_CANARY");
+    f.host.issues.requestConfirmation.mockRejectedValueOnce(new Error("INTERNAL_SECRET_CANARY"));
+    await expect(f.invoke()).rejects.toMatchObject({ code: "notice_unverified" });
+    expect(f.fetch).toHaveBeenCalledTimes(index + 1);
+    const frozen = await f.read();
+    expect(frozen?.status).toBe("uncertain");
+    await expect(f.restart()).resolves.toEqual({ status: "quarantined" });
+    expect(await f.read()).toEqual(frozen);
+    expect(f.fetch).toHaveBeenCalledTimes(index + 1);
+    const firstNotice = f.host.issues.requestConfirmation.mock.calls[0]![1];
+    expect(f.host.issues.requestConfirmation.mock.calls[1]![1]).toEqual(firstNotice);
+    expect(JSON.stringify({ journal: frozen, notice: firstNotice })).not.toMatch(/INTERNAL_SECRET_CANARY|BOOTSTRAP_SECRET_CANARY/);
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(index + 1);
+  });
+
+  it.each(["mint", "create"])("treats a malformed successful %s response as unknown, not a replay opportunity", async (stage) => {
+    const f = await deploymentFixture();
+    const index = stage === "mint" ? 1 : 3;
+    f.responses[index] = Response.json({ success: true, result: { metadata: "INTERNAL_SECRET_CANARY" } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(index + 1);
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it.each(["before", "after"])("does not dispatch a create after %s-commit token-intent failure", async (when) => {
+    const f = await deploymentFixture();
+    let failed = false;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const encoded = params?.[0];
+      if (!failed && typeof encoded === "string" && encoded.includes('"kind":"token_intent"')) {
+        failed = true;
+        if (when === "after") await db.execute(sql, params);
+        throw new Error("DATABASE_SECRET_CANARY");
+      }
+      return db.execute(sql, params);
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(1);
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it.each(["token_acknowledged", "application_acknowledged"])("freezes a lost %s receipt without further remote calls", async (kind) => {
+    const f = await deploymentFixture();
+    let failed = false;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const encoded = params?.[0];
+      const result = await db.execute(sql, params);
+      if (!failed && typeof encoded === "string" && encoded.includes(`"kind":"${kind}"`)) {
+        failed = true;
+        throw new Error("DATABASE_SECRET_CANARY");
+      }
+      return result;
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(kind === "token_acknowledged" ? 2 : 4);
+    expect((await f.read())?.facts.some((fact) => fact.kind === kind)).toBe(true);
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it("does not treat a lost approval-burn receipt as permission to mint", async () => {
+    const f = await deploymentFixture();
+    let failed = false;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const result = await db.execute(sql, params);
+      if (!failed) { failed = true; throw new Error("DATABASE_SECRET_CANARY"); }
+      return result;
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.deps.resolveBootstrap).not.toHaveBeenCalled();
+    expect(f.fetch).not.toHaveBeenCalled();
+    expect((await f.read())?.burnedInteractionIds).toHaveLength(1);
+  });
+
+  it("does not resolve credentials from a claim whose caller became terminal during approval", async () => {
+    const f = await deploymentFixture();
+    const audit = f.host.authorization.audit.search.getMockImplementation()!;
+    f.host.authorization.audit.search.mockImplementationOnce(async () => {
+      f.source.status = "done";
+      return audit();
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect((await f.read())?.burnedInteractionIds).toHaveLength(1);
+    expect((await f.read())?.claim?.operation).toBe("deploy_container");
+    expect(f.deps.resolveBootstrap).not.toHaveBeenCalled();
+    expect(f.fetch).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the claim after secret resolution and denies a predecessor frozen by restart", async () => {
+    const f = await deploymentFixture();
+    f.deps.resolveBootstrap.mockImplementationOnce(async () => {
+      await f.restart();
+      return "BOOTSTRAP_SECRET_CANARY";
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "journal_unverified" });
+    expect(f.fetch).not.toHaveBeenCalled();
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it("cannot progress after a restart observer freezes a still-pending provider mint", async () => {
+    const f = await deploymentFixture();
+    const fetch = f.fetch.getMockImplementation()!;
+    let calls = 0;
+    f.fetch.mockImplementation(async (...args) => {
+      if (++calls === 2) await f.restart();
+      return fetch(...args);
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect((await f.read())?.status).toBe("uncertain");
+    expect((await f.read())?.facts.some((fact) => fact.kind === "token_acknowledged")).toBe(false);
+  });
+
+  it.each(["mint", "token-read", "create"])("stops at first 401 during %s without relabeling it as unknown create", async (stage) => {
+    const f = await deploymentFixture();
+    const index = ["mint", "token-read", "create"].indexOf(stage) + 1;
+    f.responses[index] = new Response("INTERNAL_SECRET_CANARY", { status: 401 });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(index + 1);
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+    expect((await f.read())?.status).toBe("cleanup_required");
+    expect((await f.read())?.claim?.operation).toBe("deploy_container");
+  });
+
+  it("keeps an acknowledged cap mismatch as an ordinary cleanup obligation, not unknown-create waiver", async () => {
+    const f = await deploymentFixture();
+    f.responses[3] = Response.json({ success: true, result: { ...f.app, max_instances: 2 } });
+    f.responses.splice(4, 1);
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(6);
+    expect((await f.read())?.facts).toContainEqual({ kind: "application_acknowledged", id: "app" });
+    expect((await f.read())?.facts).toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.status).toBe("cleanup_required");
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("allows private revocation after the issue closes but does not report a live success", async () => {
+    const f = await deploymentFixture();
+    const fetch = f.fetch.getMockImplementation()!;
+    let calls = 0;
+    f.fetch.mockImplementation(async (...args) => {
+      if (++calls === 5) f.source.status = "done";
+      return fetch(...args);
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(7);
+    expect((await f.read())?.facts).toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.claim).not.toBeNull();
+  });
+
+  it.each([2, 3])("revokes a known token when local authorization refuses after HTTP call %s", async (stopAfter) => {
+    const f = await deploymentFixture();
+    f.responses.splice(stopAfter, 5 - stopAfter);
+    const fetch = f.fetch.getMockImplementation()!;
+    let calls = 0;
+    f.fetch.mockImplementation(async (...args) => {
+      const response = await fetch(...args);
+      if (++calls === stopAfter) f.source.status = "done";
+      return response;
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(stopAfter + 2);
+    expect((await f.read())?.facts).toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.status).toBe("cleanup_required");
+    expect(f.fetch.mock.calls.some(([, init]) => init?.method === "POST" && typeof init.body === "string" && init.body.includes('"scheduling_policy"'))).toBe(false);
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the verified token expiry after the asynchronous application-intent receipt", async () => {
+    const f = await deploymentFixture();
+    let clock = nowMs;
+    f.deps.now = () => clock;
+    f.responses.splice(3, 2);
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const result = await db.execute(sql, params);
+      if (typeof params?.[0] === "string" && JSON.parse(params[0]).facts.at(-1)?.kind === "application_intent") clock = nowMs + 300000;
+      return result;
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch.mock.calls.map(([, init]) => init?.method)).toEqual(["GET", "POST", "GET", "DELETE", "GET"]);
+    expect((await f.read())?.facts).toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.status).toBe("cleanup_required");
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+  });
+
+  it.each([300000, 0])("refuses success when the final live receipt crosses expiry minus %s", async (lead) => {
+    const f = await deploymentFixture();
+    let clock = nowMs;
+    f.deps.now = () => clock;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const result = await db.execute(sql, params);
+      if (typeof params?.[0] === "string" && JSON.parse(params[0]).status === "live") clock = Date.parse(f.env.expiresAt) - lead;
+      return result;
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(await f.read()).toMatchObject({ status: "live", claim: null });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(7);
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch token revocation after its intent write fails", async () => {
+    const f = await deploymentFixture();
+    let failed = false;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const encoded = params?.[0];
+      if (!failed && typeof encoded === "string" && encoded.includes('"kind":"token_revocation_intent"')) {
+        failed = true;
+        throw new Error("DATABASE_SECRET_CANARY");
+      }
+      return db.execute(sql, params);
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(5);
+    expect((await f.read())?.facts).not.toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it("does not report quarantine success on a lost freeze receipt; restart retries delivery only", async () => {
+    const f = await deploymentFixture();
+    f.responses[3] = new Error("INTERNAL_SECRET_CANARY");
+    let failed = false;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const result = await db.execute(sql, params);
+      if (!failed && typeof params?.[0] === "string" && params[0].includes('"kind":"quarantined"')) {
+        failed = true;
+        throw new Error("DATABASE_SECRET_CANARY");
+      }
+      return result;
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "journal_unverified" });
+    expect((await f.read())?.status).toBe("uncertain");
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+    await expect(f.restart()).resolves.toEqual({ status: "quarantined" });
+    expect(f.host.issues.requestConfirmation).toHaveBeenCalledTimes(1);
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not return success after a lost live-commit receipt or replay its completed create", async () => {
+    const f = await deploymentFixture();
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      const result = await db.execute(sql, params);
+      if (typeof params?.[0] === "string" && JSON.parse(params[0]).status === "live") throw new Error("DATABASE_SECRET_CANARY");
+      return result;
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "journal_unverified" });
+    expect(await f.read()).toMatchObject({ status: "live", claim: null });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(7);
+    // A live unclaimed record remains for the ordinary cleanup scheduler, not
+    // for ambiguous-create replay or release of this retained account slot.
+    await expect(f.restart()).resolves.toEqual({ status: "idle" });
+  });
+
+  it("does not apply the unknown-create exception to a definitive application 403", async () => {
+    const f = await deploymentFixture();
+    f.responses[3] = new Response("INTERNAL_SECRET_CANARY", { status: 403 });
+    f.responses.splice(4, 1);
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(6);
+    expect((await f.read())?.facts).toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.status).toBe("cleanup_required");
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+  });
+
+  it.each([408, 429, 500])("treats a create HTTP %s as an unknown outcome and never dispatches finally revocation", async (status) => {
+    const f = await deploymentFixture();
+    f.responses[3] = new Response("INTERNAL_SECRET_CANARY", { status });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it.each([401, 403])("retains HTTP %s as ordinary cleanup across restart, not the unknown-create exception", async (status) => {
+    const f = await deploymentFixture();
+    f.responses[3] = new Response("INTERNAL_SECRET_CANARY", { status });
+    if (status === 403) f.responses.splice(4, 1);
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    const failed = await f.read();
+    expect(failed?.status).toBe("cleanup_required");
+    await expect(f.restart()).resolves.toEqual({ status: "cleanup_required" });
+    expect(await f.read()).toEqual(failed);
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).toHaveBeenCalledTimes(status === 401 ? 4 : 6);
+  });
+
+  it.each(["before", "after"])("does not dispatch after a %s-commit ordinary-failure receipt loss", async (when) => {
+    const f = await deploymentFixture();
+    f.responses[3] = new Response(null, { status: 401 });
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      if (typeof params?.[0] === "string" && JSON.parse(params[0]).status === "cleanup_required") {
+        if (when === "after") await db.execute(sql, params);
+        throw new Error("DATABASE_SECRET_CANARY");
+      }
+      return db.execute(sql, params);
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "journal_unverified" });
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+    if (when === "after") {
+      await expect(f.restart()).resolves.toEqual({ status: "cleanup_required" });
+      expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps ordinary cleanup exclusion and refuses quarantine, stale appends or premature finish", async () => {
+    const f = await deploymentFixture();
+    const claimed = await journal.beginApproved(f.snapshot, {
+      attemptId: "ordinary-failure", operation: "deploy_container", host: f.deps.host, pluginVersion: version, policy,
+    }, () => nowMs);
+    const failed = await journal.requireCleanup(claimed, "ordinary-failure");
+    expect(failed).toEqual({ ...claimed, revision: claimed.revision + 1, status: "cleanup_required" });
+    await expect(other.quarantine(failed, "interrupted_attempt")).rejects.toMatchObject({ code: "conflict" });
+    await expect(other.finish(failed, "ordinary-failure", "live")).rejects.toMatchObject({ code: "conflict" });
+    await expect(other.append(failed, "ordinary-failure", { kind: "application_intent" })).rejects.toMatchObject({ code: "conflict" });
+    await expect(other.append(claimed, "ordinary-failure", { kind: "application_intent" })).rejects.toMatchObject({ code: "conflict" });
+    expect(await f.read()).toEqual(failed);
+    await expect(f.restart()).resolves.toEqual({ status: "cleanup_required" });
+    expect(f.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["before", "after"])("does not create after a %s-commit application-intent receipt loss", async (when) => {
+    const f = await deploymentFixture();
+    let failed = false;
+    f.deps.journal = new ContainerJournal({ ...db, execute: async (sql, params) => {
+      if (!failed && typeof params?.[0] === "string" && JSON.parse(params[0]).facts.at(-1)?.kind === "application_intent") {
+        failed = true;
+        if (when === "after") await db.execute(sql, params);
+        throw new Error("DATABASE_SECRET_CANARY");
+      }
+      return db.execute(sql, params);
+    } });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(3);
+    expect((await f.read())?.status).toBe("uncertain");
+  });
+
+  it("does not progress after a create reply arrives behind a restart freeze", async () => {
+    const f = await deploymentFixture();
+    const fetch = f.fetch.getMockImplementation()!;
+    let calls = 0;
+    f.fetch.mockImplementation(async (...args) => {
+      if (++calls === 4) await f.restart();
+      return fetch(...args);
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "quarantined" });
+    expect(f.fetch).toHaveBeenCalledTimes(4);
+    const frozen = await f.read();
+    expect(frozen?.status).toBe("uncertain");
+    expect(frozen?.facts.some((fact) => fact.kind === "application_acknowledged")).toBe(false);
+    const notice = f.host.issues.requestConfirmation.mock.calls[0]![1];
+    expect(JSON.stringify({ frozen, notice })).not.toMatch(/INTERNAL_SECRET_CANARY|BOOTSTRAP_SECRET_CANARY/);
+  });
+
+  it("does not quarantine or post notices for an idle ready or live slot on startup", async () => {
+    const f = await deploymentFixture();
+    await expect(f.restart()).resolves.toEqual({ status: "idle" });
+    await f.invoke();
+    await expect(f.restart()).resolves.toEqual({ status: "idle" });
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
   });
 
   it("rejects corrupt stored documents rather than repairing them permissively", async () => {

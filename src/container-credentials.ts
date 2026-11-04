@@ -99,13 +99,10 @@ export class ContainerCredentialBroker {
   }
 
   private async requestOnce(method: "GET" | "POST" | "DELETE", suffix: string, body?: unknown, allowAbsent = false): Promise<unknown> {
-    let response: Response;
-    try {
-      response = await this.#fetch(`https://api.cloudflare.com/client/v4/accounts/${this.#accountId}/tokens${suffix}`, {
-        method, headers: { Authorization: `Bearer ${this.#bootstrap}`, "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body), redirect: "error",
-      });
-    } catch { this.#session.stopAfterTransportFailure(); }
+    const response = await this.#session.dispatch(this.#fetch, `https://api.cloudflare.com/client/v4/accounts/${this.#accountId}/tokens${suffix}`, {
+      method, headers: { Authorization: `Bearer ${this.#bootstrap}`, "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body), redirect: "error",
+    });
     if (response.status === 401) this.#session.stopAfterAuthenticationFailure();
     if (response.status === 404 && allowAbsent) return null;
     if (!response.ok) throw new ContainerApiError("cloudflare_failed", response.status);

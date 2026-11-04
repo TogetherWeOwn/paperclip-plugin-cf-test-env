@@ -45,6 +45,21 @@ function details(obligation: ContainerCleanupObligation): string {
   ].join("\n\n");
 }
 
+/** Preflight before acquiring a mutation claim or resolving a credential. */
+export async function assertContainerCleanupInbox(host: CleanupHost, companyId: string, input: ContainerCleanupPolicy): Promise<void> {
+  try {
+    const policy = capturePolicy(input);
+    const members = await host.access.members.list({ companyId });
+    if (!Array.isArray(members) || members.filter((member) => member.companyId === companyId
+      && member.principalType === "user" && member.principalId === policy.operatorUserId && member.status === "active"
+      && typeof member.membershipRole === "string" && ["owner", "admin", "member"].includes(member.membershipRole)).length !== 1) throw new ContainerCleanupNoticeError();
+    const issue = await host.issues.get(policy.cleanupIssueId, companyId);
+    if (!issue || issue.id !== policy.cleanupIssueId || issue.companyId !== companyId
+      || !["todo", "in_progress", "in_review"].includes(issue.status)
+      || issue.assigneeUserId !== policy.operatorUserId || issue.assigneeAgentId != null) throw new ContainerCleanupNoticeError();
+  } catch { throw new ContainerCleanupNoticeError(); }
+}
+
 /**
  * Notification only: no Cloudflare, secrets, interaction response or journal-write
  * capability. The dedicated operator inbox outlives the env's possibly closed
@@ -63,16 +78,7 @@ export async function notifyContainerQuarantine(host: CleanupHost, journal: Pick
       || policy.cleanupIssueId === obligation.issueId) throw new ContainerCleanupNoticeError();
     const digest = createHash("sha256").update(JSON.stringify(obligation)).digest("hex");
     const target = { type: "custom" as const, key: `cf-test-env:quarantine:${obligation.envId}`, revisionId: digest, revisionNumber: obligation.generation };
-    const members = await host.access.members.list({ companyId });
-    if (!Array.isArray(members) || members.filter((member) => member.companyId === companyId
-      && member.principalType === "user" && member.principalId === policy.operatorUserId && member.status === "active"
-      && typeof member.membershipRole === "string" && ["owner", "admin", "member"].includes(member.membershipRole)).length !== 1) throw new ContainerCleanupNoticeError();
-    const assertInbox = async () => {
-      const issue = await host.issues.get(policy.cleanupIssueId, companyId);
-      if (!issue || issue.id !== policy.cleanupIssueId || issue.companyId !== companyId
-        || !["todo", "in_progress", "in_review"].includes(issue.status)
-        || issue.assigneeUserId !== policy.operatorUserId || issue.assigneeAgentId != null) throw new ContainerCleanupNoticeError();
-    };
+    const assertInbox = () => assertContainerCleanupInbox(host, companyId, policy);
     await assertInbox();
     const prompt = `Confirm human cleanup follow-up for quarantined ${obligation.envId}, generation ${obligation.generation}?`;
     const detailsMarkdown = details(obligation);

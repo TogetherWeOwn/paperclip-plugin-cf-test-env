@@ -31,6 +31,20 @@ export class ContainerApiSession {
   #authenticationFailed = false;
   #transportFailed = false;
   #inFlight = false;
+  #beforeDispatch?: (url: string, init: RequestInit) => Promise<void>;
+
+  constructor(beforeDispatch?: (url: string, init: RequestInit) => Promise<void>) {
+    this.#beforeDispatch = beforeDispatch;
+  }
+
+  /** Local refusals are not transport ambiguity. Recheck capability after awaits. */
+  async dispatch(fetch: FetchImpl, url: string, init: RequestInit, assertCurrent: () => void = () => undefined): Promise<Response> {
+    if (this.#beforeDispatch) await this.#beforeDispatch(url, init);
+    this.assertCallable();
+    assertCurrent();
+    try { return await fetch(url, init); }
+    catch { this.stopAfterTransportFailure(); }
+  }
 
   /** No queue: a pending request can still fail authentication or be ambiguous. */
   async request<T>(run: () => Promise<T>): Promise<T> {
@@ -110,18 +124,12 @@ export class ContainerApplicationApi {
   }
 
   private async requestOnce(method: "GET" | "POST" | "DELETE", suffix: string, body?: unknown, allowAbsent = false): Promise<Envelope | null> {
-    let response: Response;
-    try {
-      response = await this.#fetch(`https://api.cloudflare.com/client/v4/accounts/${this.#accountId}/containers/applications${suffix}`, {
-        method,
-        headers: { Authorization: `Bearer ${this.#token}`, "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        redirect: "error",
-      });
-    } catch {
-      // Network exceptions can include URLs/headers. Never keep their cause.
-      this.#session.stopAfterTransportFailure();
-    }
+    const response = await this.#session.dispatch(this.#fetch, `https://api.cloudflare.com/client/v4/accounts/${this.#accountId}/containers/applications${suffix}`, {
+      method,
+      headers: { Authorization: `Bearer ${this.#token}`, "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: "error",
+    }, this.#assertCurrent);
     if (response.status === 401) this.#session.stopAfterAuthenticationFailure();
     if (response.status === 404 && allowAbsent) return null;
     if (!response.ok) throw new ContainerApiError("cloudflare_failed", response.status);

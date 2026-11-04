@@ -5,8 +5,8 @@
 **Work in progress; container tools are not registered.** The current change adds
 strict contracts, an application protocol client, an internal credential helper,
 an independent-approval evidence predicate, a PostgreSQL coordination journal,
-current caller/checkout checks, irreversible quarantine, and an operator-notice
-adapter. It does not yet provide an operational
+current caller/checkout checks, irreversible quarantine, an operator-notice
+adapter, and an unregistered application-deployment coordinator. It does not yet provide an operational
 container environment. The existing non-container tools and their
 behavior are unchanged.
 
@@ -122,10 +122,31 @@ Implemented primitives:
   before revocation starts, including callback failure. A retained client cannot
   start later requests; invalid or backwards clocks refuse.
 
-Required integration: enforce ownership/approval and single-use consumption
-before minting or application calls; forbid replacement/overlapping rollout;
-connect the resource journal and ambiguous-create/token recovery; pin and bundle
-an actually reviewed compatible Sandbox runtime and its complete limits.
+The unregistered application coordinator derives identity from the ready journal,
+preflights the current caller and dedicated cleanup inbox before credentials,
+and atomically burns the pinned approval/acquires its operation claim. Before
+remote dispatch it repeats caller and exact retained-claim checks. Token mint,
+application create and token revocation require successful write-ahead receipts;
+acknowledged IDs are persisted before further calls. Lost receipts authorize no
+remote replay. Unknown mint/create outcomes close dispatch, freeze the journal
+and deliver the operator notice. A timeout, rate-limit/server reply or malformed
+successful create response is not assumed to be a definitive refusal. Revocation
+is a private finally path and may finish after the issue/TTL closes, but not after
+the session's first 401, unknown create or failed write-ahead receipt. Successful
+revocation alone is not application cleanup. Local asynchronous dispatch guards
+run outside the HTTP transport catch: a proven pre-dispatch authorization refusal
+does not poison the private revocation path. Actual fetch rejection still closes
+the shared session permanently. The application capability is checked again after
+all asynchronous guards, immediately before HTTP invocation. A final live journal
+receipt also rechecks the original deployment cutoff before returning success;
+an expired receipt leaves committed state for ordinary cleanup, never replay.
+These checks do not cancel dispatched requests or provide provider-side fencing.
+
+Required integration: fetch current Worker ownership evidence, pin and bundle an
+actually reviewed compatible Sandbox runtime and its complete limits, and connect
+this application leg to full provisioning, automatic cleanup and narrow registered
+handlers. It is not an operational deployment tool. Existing journal identity is
+not independent evidence of current Worker ownership or trusted bundle contents.
 
 The public-image path transfers no OCI bytes and creates no managed registry
 image. It requires no registry credential or image push. Managed registry cleanup
@@ -222,10 +243,22 @@ lifecycle adapters still have to perform the actual read-back/absence operations
 Claims have **no automatic expiry or takeover**. A crash or ambiguous remote
 outcome retains the claim instead of freeing capacity. A new process can read
 that obligation and irreversibly freeze it, but cannot steal it through this API.
-Startup reconciliation and lifecycle integration remain unimplemented; a permanent
-lock is safe exclusion, not sufficient availability or a working TTL cleanup
-system. Before registration, every tool/job/event must use the journal and route
-unknown outcomes to the quarantine-and-human-cleanup path below.
+A credential-free restart observer now freezes an interrupted/unclassified claim
+and retries notice delivery without replaying remote calls. It does not schedule
+itself or implement ordinary cleanup. A settled coordinator failure with no
+pending unknown create or journal write instead records `cleanup_required`, keeping
+the original claim, facts and burned approval. A definitive 401/403 or acknowledged
+unsafe application cannot silently become an unknown-create deadline exception on
+restart. This marker permits no append, finish, quarantine or claim takeover; its
+ordinary cleanup protocol is still a release gate. An unsuccessful marker write
+returns a fixed journal error and permits no further remote call. An interruption
+before that distinction is durably recorded still freezes conservatively; this is
+not a claim of provider settlement or deadline compliance.
+
+A permanent lock is safe exclusion, not sufficient availability or a working TTL
+cleanup system. Before registration, every tool/job/event must use the journal,
+route unknown outcomes to the quarantine-and-human-cleanup path below and retain
+ordinary cleanup obligations without treating them as the accepted exception.
 
 A per-request journal read or time check is not provider-side fencing: a process
 can pause after checking, and the provider can accept a request before its response
@@ -268,8 +301,8 @@ Implemented journal behavior:
   requests or a writer paused after its last check.
 - A lost quarantine-write receipt is failure, not success. A surviving original
   claim remains a reconciliation obligation if that write did not commit. A
-  lifecycle must stop dispatch and re-read before attempting notification; this
-  integration is still required.
+  coordinator stops dispatch and re-reads before attempting notification; a lost
+  freeze receipt is not reported as successful quarantine.
 
 The notification adapter reads the durable frozen record and reduces it to env,
 account, generation, resource prefix/names, known non-secret IDs and conservative
@@ -288,11 +321,12 @@ lost replies and mismatched receipts return a fixed notice error. Notification
 retries reuse the host idempotency key; they never retry a provider create. Human
 acceptance or rejection neither proves cleanup nor clears the frozen claim.
 
-Before release, startup preflight must validate that inbox, and every unknown
-create/interrupted attempt must durably freeze and deliver/retry the notice.
-Notification failure must remain visibly outstanding, not count as completed
-recovery. The adapter is not wired to lifecycle handlers yet and no live cleanup
-inbox or interaction has been created by these tests. Do not invent a finite
+The application coordinator validates the inbox before acquiring its claim or
+resolving credentials, and the restart observer retries exact-env notices for
+frozen claims. Neither is wired to registered handlers or startup scheduling yet.
+Before release those entrypoints must validate the inbox and reliably deliver/retry
+notices. Notification failure remains an explicit error, not completed recovery.
+No live cleanup inbox or interaction has been created by these tests. Do not invent a finite
 settlement delay, steal a claim, use a new session to escape quarantine, or call
 absence proof of terminal settlement. No credential change is authorized.
 
@@ -386,6 +420,14 @@ operator routing, exact targets, idempotent retries, foreign/closed inboxes,
 current membership, policy mutation, sanitized errors and unchanged quarantine
 after human acknowledgement. These are not registered-handler or live delivery
 tests.
+
+The application coordinator additionally runs against real PostgreSQL and injected
+HTTP: approval burn/concurrent deployment exclusion, caller/inbox preflight,
+write-ahead mint/create/revoke ordering, before/after-commit receipt loss,
+acknowledged-ID persistence, late responses behind restart freezes, first-401 stop,
+unsafe-cap/403 ordinary cleanup classification, immutable notice retry and reduced
+secret-free results/journal/notices. These do not prove ordinary automatic cleanup,
+registered-handler behavior, live Worker ownership or runtime/spend controls.
 
 Before release, add integration fixtures for the actual registered handlers,
 full teardown ordering, restart quarantine and reliable operator escalation for

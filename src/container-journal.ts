@@ -13,7 +13,7 @@ type Database = PluginContext["db"];
 type ApprovalHost = Pick<PluginContext, "issues" | "access" | "authorization">;
 export type ContainerReservation = Omit<ContainerIdentity, "workerTag" | "namespaceId" | "applicationId">;
 type Operation = "provision_container" | ContainerOperation;
-type Status = "reserved" | "ready" | "live" | "uncertain" | "closed";
+type Status = "reserved" | "ready" | "live" | "cleanup_required" | "uncertain" | "closed";
 const quarantineReasons = ["remote_outcome_unknown", "journal_outcome_unknown", "interrupted_attempt"] as const;
 export type ContainerQuarantineReason = typeof quarantineReasons[number];
 
@@ -23,6 +23,7 @@ export type ContainerJournalFact =
   | { kind: "application_acknowledged"; id: string }
   | { kind: "token_intent"; name: string; expiresAt: string }
   | { kind: "token_acknowledged"; id: string }
+  | { kind: "token_revocation_intent"; id: string }
   | { kind: "token_revoked"; id: string }
   | { kind: "absence_verified"; resource: "application" | "worker" | "tokens" }
   | { kind: "quarantined"; reason: ContainerQuarantineReason };
@@ -99,6 +100,7 @@ function assertFact(value: unknown, reservation: ContainerReservation): asserts 
     case "application_intent": exact(value, ["kind"]); return;
     case "application_acknowledged":
     case "token_acknowledged":
+    case "token_revocation_intent":
     case "token_revoked":
       exact(value, ["kind", "id"]);
       if (!validId(value.id)) throw new ContainerJournalError("invalid_journal");
@@ -134,6 +136,8 @@ function credentialWork(facts: ContainerJournalFact[]) {
       pending.id = fact.id;
       acknowledged.add(fact.id);
       lastActivity = index;
+    } else if (fact.kind === "token_revocation_intent") {
+      if (!pending || pending.id !== fact.id) throw new ContainerJournalError("invalid_journal");
     } else if (fact.kind === "token_revoked") {
       if (!pending || pending.id !== fact.id) throw new ContainerJournalError("invalid_journal");
       pending = null;
@@ -150,7 +154,7 @@ function credentialWork(facts: ContainerJournalFact[]) {
 function assertDocument(value: unknown): asserts value is JournalDocument {
   exact(value, ["reservation", "status", "facts", "claim", "approval", "burnedInteractionIds"]);
   assertReservation(value.reservation);
-  if (!["reserved", "ready", "live", "uncertain", "closed"].includes(String(value.status))
+  if (!["reserved", "ready", "live", "cleanup_required", "uncertain", "closed"].includes(String(value.status))
     || !Array.isArray(value.facts) || value.facts.length > MAX_FACTS
     || !Array.isArray(value.burnedInteractionIds) || value.burnedInteractionIds.length > MAX_APPROVALS
     || !value.burnedInteractionIds.every(validId)
@@ -160,6 +164,7 @@ function assertDocument(value: unknown): asserts value is JournalDocument {
   if (value.status === "uncertain"
     ? quarantines.length !== 1 || value.facts.at(-1) !== quarantines[0] || value.claim === null
     : quarantines.length !== 0) throw new ContainerJournalError("invalid_journal");
+  if (value.status === "cleanup_required" && value.claim === null) throw new ContainerJournalError("invalid_journal");
   credentialWork(value.facts);
   if (value.claim !== null) {
     exact(value.claim, ["id", "operation"]);
@@ -181,7 +186,8 @@ function document(snapshot: ContainerJournalSnapshot): JournalDocument {
   return structuredClone(doc);
 }
 
-function identity(snapshot: ContainerJournalSnapshot): ContainerIdentity {
+export function containerJournalIdentity(snapshot: ContainerJournalSnapshot): ContainerIdentity {
+  document(snapshot);
   const workers = snapshot.facts.filter((fact) => fact.kind === "worker_acknowledged");
   const applications = snapshot.facts.filter((fact) => fact.kind === "application_acknowledged");
   if (workers.length !== 1 || applications.length > 1) throw new ContainerJournalError("invalid_journal");
@@ -305,7 +311,7 @@ export class ContainerJournal {
   /** Freeze only: an observer can quarantine an interrupted claim, never take it. */
   async quarantine(snapshot: ContainerJournalSnapshot, reason: ContainerQuarantineReason): Promise<ContainerJournalSnapshot> {
     const next = document(snapshot);
-    if (!next.claim || next.status === "closed" || next.status === "uncertain") throw new ContainerJournalError("conflict");
+    if (!next.claim || ["closed", "uncertain", "cleanup_required"].includes(next.status)) throw new ContainerJournalError("conflict");
     const fact: ContainerJournalFact = { kind: "quarantined", reason };
     assertFact(fact, next.reservation);
     next.status = "uncertain";
@@ -315,7 +321,7 @@ export class ContainerJournal {
 
   async append(snapshot: ContainerJournalSnapshot, attemptId: string, fact: ContainerJournalFact): Promise<ContainerJournalSnapshot> {
     const next = document(snapshot);
-    if (!next.claim || next.claim.id !== attemptId || next.status === "uncertain") throw new ContainerJournalError("conflict");
+    if (!next.claim || next.claim.id !== attemptId || ["uncertain", "cleanup_required"].includes(next.status)) throw new ContainerJournalError("conflict");
     assertFact(fact, next.reservation);
     // Always leave room to persist the irreversible quarantine marker.
     if (fact.kind === "quarantined" || next.facts.length >= MAX_FACTS - 1) throw new ContainerJournalError("invalid_journal");
@@ -330,14 +336,25 @@ export class ContainerJournal {
     return this.replace(snapshot, next);
   }
 
+  /** Only a settled coordinator failure, never an observer's guess at settlement. */
+  async requireCleanup(snapshot: ContainerJournalSnapshot, attemptId: string): Promise<ContainerJournalSnapshot> {
+    const next = document(snapshot);
+    if (!next.claim || next.claim.id !== attemptId || next.claim.operation !== "deploy_container"
+      || next.status !== "ready") throw new ContainerJournalError("conflict");
+    // Keep exclusion and obligations. Ordinary recovery still needs its own
+    // reviewed protocol; this marker grants neither replay nor the create waiver.
+    next.status = "cleanup_required";
+    return this.replace(snapshot, next);
+  }
+
   /** End a known attempt only; ambiguous remote outcomes retain their claim. */
   async finish(snapshot: ContainerJournalSnapshot, attemptId: string, status: "ready" | "live" | "closed"): Promise<ContainerJournalSnapshot> {
     const next = document(snapshot);
-    if (!next.claim || next.claim.id !== attemptId || next.status === "uncertain") throw new ContainerJournalError("conflict");
+    if (!next.claim || next.claim.id !== attemptId || ["uncertain", "cleanup_required"].includes(next.status)) throw new ContainerJournalError("conflict");
     const operation = next.claim.operation;
     if ((status === "ready" && operation !== "provision_container") || (status === "live" && operation !== "deploy_container")
       || (status === "closed" && operation !== "teardown_container") || !["ready", "live", "closed"].includes(status)) throw new ContainerJournalError("invalid_journal");
-    if (status !== "closed") identity(snapshot);
+    if (status !== "closed") containerJournalIdentity(snapshot);
     if (status === "live" && !next.facts.some((f) => f.kind === "application_acknowledged")) throw new ContainerJournalError("invalid_journal");
     const credentials = credentialWork(next.facts);
     if (credentials.pending || (status === "closed" && (!credentials.terminalAbsence
@@ -367,7 +384,7 @@ export class ContainerJournal {
     if (!validId(attemptId) || next.claim || next.status === "closed" || !approval || approval.operation !== operation
       || approval.pin.consumedAt !== undefined || next.burnedInteractionIds.includes(approval.pin.interactionId)) throw new ContainerJournalError("approval_required");
     if (operation === "deploy_container" && (next.status !== "ready" || next.facts.some((fact) => fact.kind === "application_intent" || fact.kind === "application_acknowledged"))) throw new ContainerJournalError("conflict");
-    const env = identity(before);
+    const env = containerJournalIdentity(before);
     const assertCurrent = (time: number) => {
       if (!Number.isFinite(time) || time < Date.parse(approval.pin.createdAt) || time >= Date.parse(approval.pin.expiresAt)) throw new ContainerJournalError("approval_required");
       if (operation === "deploy_container") assertContainerActive(env, time);

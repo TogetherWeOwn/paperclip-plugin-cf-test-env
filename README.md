@@ -133,11 +133,20 @@ cleanup inbox, not the possibly closed env source issue. Host idempotency retrie
 only notification; accepting the card does not prove terminal settlement or free
 capacity. Missing/invalid operator or inbox configuration fails closed.
 
-These are journal and host-adapter primitives, **not operational tools**. Actual
-lifecycle dispatch, write-ahead intent, startup quarantine/notification retry,
-ordinary cleanup, reviewed runtime/image and all-in spend controls still need
-integration and acceptance tests. No live cleanup inbox or plugin configuration
-is created here.
+An unregistered application coordinator now composes the journal, current caller,
+independent approval and injected HTTP clients: mint/create/revoke write-ahead
+receipts precede dispatch, acknowledged IDs precede further calls, and unknown
+mint/create outcomes permanently freeze and notify. A credential-free observer
+can freeze interrupted claims and retry notices, never replay a create. Settled
+ordinary failures retain a separate `cleanup_required` claim so restart cannot
+silently apply the unknown-create exception to a definitive refusal or unsafe cap.
+This marker is not teardown proof or permission to resume mutations.
+
+These remain **non-operational components**, not registered tools or scheduled
+jobs. Worker upload/current ownership fetching, ordinary automatic cleanup,
+reviewed runtime/image, all-in spend controls and handler integration/acceptance
+still need implementation. No live cleanup inbox or plugin configuration is
+created here.
 
 ## License
 
