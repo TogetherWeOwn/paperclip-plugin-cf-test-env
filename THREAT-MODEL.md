@@ -73,12 +73,25 @@ pinned version at 100%; finding that version in old history is not enough. Extra
 bindings (including AI, R2 and D1) refuse. Only success or fixed refusal is returned,
 not provider metadata.
 
-Required integration: preflight Worker absence; connect intent and acknowledged
-resource IDs to actual operations; read evidence from the correct account/script
-endpoints under writer exclusion. The pure predicate does not attest freshness,
-bundle contents, runtime safety, or the absence of a concurrent writer. Return a
-fixed non-secret result. **No Worker Admin token is returned for a container
-environment.** A reservation alone is not a live env.
+A read-only HTTP adapter now fetches script metadata from the account scripts
+collection, the pinned version from its version endpoint, the independent namespace
+from a fully scanned bounded paginated inventory, and the serving deployment last.
+It rejects duplicate/conflicting tuples, partial collections and inconsistent
+pagination. The nonpaginated account-wide scripts response has a separate 16 MiB
+UTF-8 budget; other evidence responses retain a 1 MiB budget, with at most 100
+namespace pages of 1,000 entries. Larger inventories fail closed. These are local
+parse/acceptance limits, not streaming bounds on the host's buffered RPC response.
+It snapshots identity before awaits, shares lifecycle 401/transport containment,
+and returns only success or fixed refusal, never provider metadata.
+The existing bootstrap credential stays private; no extra Containers-token grants
+or alternate bootstrap credential are introduced. Missing permissions fail closed.
+
+Required integration: preflight Worker absence; connect upload intent and
+acknowledged resource IDs to actual provisioning operations and attest the trusted
+bundle. Point-in-time evidence retrieval does not attest bundle contents, runtime
+safety, or the absence of a concurrent writer. Return a fixed non-secret result.
+**No Worker Admin token is returned for a container environment.** A reservation
+alone is not a live env.
 
 ### `deploy_container`
 
@@ -142,11 +155,18 @@ receipt also rechecks the original deployment cutoff before returning success;
 an expired receipt leaves committed state for ordinary cleanup, never replay.
 These checks do not cancel dispatched requests or provide provider-side fencing.
 
-Required integration: fetch current Worker ownership evidence, pin and bundle an
-actually reviewed compatible Sandbox runtime and its complete limits, and connect
-this application leg to full provisioning, automatic cleanup and narrow registered
-handlers. It is not an operational deployment tool. Existing journal identity is
-not independent evidence of current Worker ownership or trusted bundle contents.
+After claim acquisition, the coordinator verifies current Worker evidence before
+credential permission preflight/mint, then repeats the evidence fetch after token
+verification and before application intent/create. Evidence drift prevents creation;
+a proven local refusal still permits otherwise-authorized private token revocation.
+Each read repeats current caller, retained-claim and original lifetime checks. This
+is not an atomic provider snapshot, a fence against external writers, or trusted
+source attestation; a saved journal identity alone is not ownership proof.
+
+Required integration: pin and bundle an actually reviewed compatible Sandbox
+runtime and its complete limits, and connect this application leg to full
+provisioning, automatic cleanup and narrow registered handlers. It is not an
+operational deployment tool.
 
 The public-image path transfers no OCI bytes and creates no managed registry
 image. It requires no registry credential or image push. Managed registry cleanup
@@ -426,8 +446,12 @@ HTTP: approval burn/concurrent deployment exclusion, caller/inbox preflight,
 write-ahead mint/create/revoke ordering, before/after-commit receipt loss,
 acknowledged-ID persistence, late responses behind restart freezes, first-401 stop,
 unsafe-cap/403 ordinary cleanup classification, immutable notice retry and reduced
-secret-free results/journal/notices. These do not prove ordinary automatic cleanup,
-registered-handler behavior, live Worker ownership or runtime/spend controls.
+secret-free results/journal/notices. Worker HTTP fixtures cover fixed supported
+paths, complete namespace pagination, tuple conflicts, malformed responses, shared
+401/transport containment and async capability checks. Coordinator regressions
+refuse changed Worker evidence before mint and after mint, retaining revocation
+without application creation. These do not prove ordinary automatic cleanup,
+registered-handler behavior, live provider permissions or runtime/spend controls.
 
 Before release, add integration fixtures for the actual registered handlers,
 full teardown ordering, restart quarantine and reliable operator escalation for

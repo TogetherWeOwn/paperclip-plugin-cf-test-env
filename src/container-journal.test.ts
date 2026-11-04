@@ -522,8 +522,22 @@ describe.skipIf(!databaseUrl)("PostgreSQL container reservation and one-shot con
       if (!response) throw new Error("No live network in fixtures");
       return response;
     });
+    const worker = {
+      script: { id: env.workerName, tag: env.workerTag },
+      version: { id: "version", resources: { bindings: [{ name: "SANDBOX", type: "durable_object_namespace", class_name: "ContainerSandbox", namespace_id: env.namespaceId }] } },
+      namespace: { id: env.namespaceId, script: env.workerName, class: "ContainerSandbox" },
+      deployments: { deployments: [{ strategy: "percentage", versions: [{ version_id: "version", percentage: 100 }] }] },
+    };
+    const workerFetch = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (url.endsWith("/workers/scripts")) return json([worker.script]);
+      if (url.endsWith("/versions/version")) return json(worker.version);
+      if (url.endsWith("/deployments")) return json(worker.deployments);
+      if (url.endsWith("/workers/durable_objects/namespaces?page=1&per_page=1000")) return Response.json({ success: true, result: [worker.namespace], result_info: { page: 1, per_page: 1000, count: 1, total_pages: 1, total_count: 1 } });
+      throw new Error("No live network in Worker fixtures");
+    });
     const deps = {
-      host: host as unknown as Parameters<typeof deployContainerApplication>[0]["host"], journal, fetch,
+      host: host as unknown as Parameters<typeof deployContainerApplication>[0]["host"], journal,
+      fetch: (url: string, init?: RequestInit) => url.includes("/workers/") ? workerFetch(url, init) : fetch(url, init),
       resolveBootstrap: vi.fn(async () => "BOOTSTRAP_SECRET_CANARY"), now: () => nowMs,
     };
     const run = { companyId: env.companyId, projectId: env.projectId, agentId: env.ownerAgentId, runId: "run" } as ToolRunContext;
@@ -531,8 +545,37 @@ describe.skipIf(!databaseUrl)("PostgreSQL container reservation and one-shot con
     const invoke = () => deployContainerApplication(deps, run, input, deploymentPolicy);
     const restart = () => reconcileContainerAttempt(deps.host, other, { accountId: env.accountId, companyId: env.companyId, policy: cleanup });
     const read = () => other.read(env.accountId, env.companyId);
-    return { deps, host, source, inbox, snapshot, deploymentPolicy, run, input, env, app, tokenId, responses, observed, fetch, invoke, restart, read };
+    return { deps, host, source, inbox, snapshot, deploymentPolicy, run, input, env, app, tokenId, responses, observed, fetch, worker, workerFetch, invoke, restart, read };
   }
+
+  it.each(["tag", "version", "namespace", "deployment"])("refuses changed Worker %s evidence before token preflight/mint", async (part) => {
+    const f = await deploymentFixture();
+    if (part === "tag") f.worker.script.tag = "foreign";
+    if (part === "version") f.worker.version.id = "foreign";
+    if (part === "namespace") f.worker.namespace.script = "production";
+    if (part === "deployment") f.worker.deployments.deployments[0]!.versions[0]!.percentage = 50;
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch).not.toHaveBeenCalled();
+    expect((await f.read())?.status).toBe("cleanup_required");
+    expect(f.host.issues.requestConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("rechecks Worker evidence after mint and revokes without application creation on drift", async () => {
+    const f = await deploymentFixture();
+    const fetch = f.fetch.getMockImplementation()!;
+    let calls = 0;
+    f.fetch.mockImplementation(async (...args) => {
+      const response = await fetch(...args);
+      if (++calls === 3) f.worker.script.tag = "recreated";
+      return response;
+    });
+    f.responses.splice(3, 2);
+    await expect(f.invoke()).rejects.toMatchObject({ code: "failed" });
+    expect(f.fetch.mock.calls.map(([, init]) => init?.method)).toEqual(["GET", "POST", "GET", "DELETE", "GET"]);
+    expect((await f.read())?.facts).toContainEqual({ kind: "token_revoked", id: f.tokenId });
+    expect((await f.read())?.facts.some((fact) => fact.kind === "application_intent")).toBe(false);
+    expect((await f.read())?.status).toBe("cleanup_required");
+  });
 
   it("integrates approval burn, write-ahead mint/create/revoke, read-back and secret-free live receipt", async () => {
     const f = await deploymentFixture();

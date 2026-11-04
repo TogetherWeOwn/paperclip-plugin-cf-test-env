@@ -7,6 +7,7 @@ import { ContainerApiSession } from "./container-api.js";
 import type { ContainerApprovalPolicy } from "./container-approval.js";
 import { assertApprovedContainerImage, assertContainerActive, parseDeployContainerInput } from "./container-contract.js";
 import { ContainerCredentialBroker, containerTokenRequest } from "./container-credentials.js";
+import { ContainerWorkerApi } from "./container-worker.js";
 import { containerJournalIdentity, type ContainerJournal, type ContainerJournalFact, type ContainerJournalSnapshot, type ContainerQuarantineReason } from "./container-journal.js";
 import { assertContainerCleanupInbox, notifyContainerQuarantine, type ContainerCleanupPolicy } from "./container-quarantine.js";
 
@@ -49,8 +50,8 @@ async function freezeAndNotify(host: Pick<Host, "issues" | "access">, journal: C
 }
 
 /**
- * Unregistered application leg, not a complete deploy tool. Worker upload/current
- * ownership fetching, trusted runtime/spend and ordinary teardown remain gates.
+ * Unregistered application leg, not a complete deploy tool. Worker upload,
+ * trusted runtime/spend and ordinary teardown remain gates.
  * No caller-selected fetch/config/source/approval or resumable claim is exposed.
  */
 export async function deployContainerApplication(deps: {
@@ -114,6 +115,8 @@ export async function deployContainerApplication(deps: {
     if (!current || current.status !== "ready" || current.claim?.id !== attemptId
       || !isDeepStrictEqual(current, snapshot)) throw new ContainerLifecycleError("failed");
   };
+  const worker = snapshot.facts.find((fact) => fact.kind === "worker_acknowledged")!;
+  const workerBase = `https://api.cloudflare.com/client/v4/accounts/${env.accountId}/workers`;
   const tokenBase = `https://api.cloudflare.com/client/v4/accounts/${env.accountId}/tokens`;
   const appBase = `https://api.cloudflare.com/client/v4/accounts/${env.accountId}/containers/applications`;
   const session = new ContainerApiSession(async (url, init) => {
@@ -124,8 +127,12 @@ export async function deployContainerApplication(deps: {
     const revoke = tokenId !== undefined && url === `${tokenBase}/${tokenId}` && method === "DELETE";
     const revokeRead = revoking && url === `${tokenBase}/${tokenId}` && method === "GET";
     const tokenRead = tokenId !== undefined && url === `${tokenBase}/${tokenId}` && method === "GET";
+    const workerRead = method === "GET" && (url === `${workerBase}/scripts`
+      || url === `${workerBase}/scripts/${env.workerName}/versions/${worker.versionId}`
+      || url === `${workerBase}/scripts/${env.workerName}/deployments`
+      || (url.startsWith(`${workerBase}/durable_objects/namespaces?`) && /^page=\d{1,3}&per_page=1000$/.test(url.slice(url.indexOf("?") + 1))));
     const app = snapshot.facts.find((fact) => fact.kind === "application_acknowledged");
-    if (!(mint || create || revoke || tokenRead || revokeRead
+    if (!(mint || create || revoke || tokenRead || revokeRead || workerRead
       || (url === `${tokenBase}/permission_groups` && method === "GET")
       || (app?.kind === "application_acknowledged" && url === `${appBase}/${app.id}` && method === "GET"))) throw new ContainerLifecycleError("failed");
     // Revocation is this attempt's private finally path, not an expired manual
@@ -158,6 +165,8 @@ export async function deployContainerApplication(deps: {
     // Secret resolution is asynchronous. A concurrent restart observer can freeze
     // this claim, so recheck before even the credential permission preflight.
     await assertClaim();
+    const workers = new ContainerWorkerApi(guardedFetch, bootstrap, env.accountId, session, () => assertContainerActive(env, now()));
+    await workers.verifyOwned(env, worker.versionId);
     const broker = new ContainerCredentialBroker(guardedFetch, bootstrap, env.accountId, session, now);
     const applicationId = await broker.withApplicationApi({
       env, groupId: policy.groupId, egressCidrs: policy.egressCidrs, purpose: "deploy",
@@ -170,10 +179,13 @@ export async function deployContainerApplication(deps: {
         },
         revoked: (id) => append({ kind: "token_revoked", id }),
       },
-    }, (api) => api.create(env, policy.approvedImage, async (id) => {
-      await append({ kind: "application_acknowledged", id });
-      pendingCreate = false;
-    }));
+    }, async (api) => {
+      await workers.verifyOwned(env, worker.versionId);
+      return api.create(env, policy.approvedImage, async (id) => {
+        await append({ kind: "application_acknowledged", id });
+        pendingCreate = false;
+      });
+    });
     await authorizeContainerEnv(host, run, env, now);
     // This receipt is not cleanup proof and does not extend the original deadline.
     snapshot = await journal.finish(snapshot, attemptId, "live");

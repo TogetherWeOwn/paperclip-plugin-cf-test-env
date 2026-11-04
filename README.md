@@ -142,11 +142,17 @@ ordinary failures retain a separate `cleanup_required` claim so restart cannot
 silently apply the unknown-create exception to a definitive refusal or unsafe cap.
 This marker is not teardown proof or permission to resume mutations.
 
+The application coordinator fetches independent Worker evidence before token
+preflight/mint and again after mint, before application creation: immutable script
+tag, pinned version/binding, fully scanned namespace inventory and latest serving
+deployment. These are point-in-time checks, not trusted-source attestation or
+provider-side fencing. They use the existing private bootstrap credential; missing
+permissions fail closed rather than authorizing another credential or wider grants.
+
 These remain **non-operational components**, not registered tools or scheduled
-jobs. Worker upload/current ownership fetching, ordinary automatic cleanup,
-reviewed runtime/image, all-in spend controls and handler integration/acceptance
-still need implementation. No live cleanup inbox or plugin configuration is
-created here.
+jobs. Worker upload/source attestation, ordinary automatic cleanup, reviewed
+runtime/image, all-in spend controls and handler integration/acceptance still need
+implementation. No live cleanup inbox or plugin configuration is created here.
 
 ## License
 
