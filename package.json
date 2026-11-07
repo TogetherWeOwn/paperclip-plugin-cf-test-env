@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-cf-test-env",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Paperclip plugin: per-card disposable Cloudflare test envs (pct-*) with per-Worker short-lived tokens. Agents deploy test Workers without touching production.",
   "license": "MIT",
   "type": "module",

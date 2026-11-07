@@ -16,8 +16,50 @@ function toolError(err: unknown): { error: string; data: { error: { message: str
   return { error: message, data: { error: { message } }, content: `Error: ${message}` };
 }
 
+// Activation replays company configs, but automatic worker recovery does not.
+// Persist only IDs in plugin-owned instance state; the host still authorizes
+// every company-scoped call, and each sweep reads current config, not a snapshot.
+const COMPANY_REGISTRY = { scopeKind: "instance" as const, stateKey: "cf-test-env:companies" };
+let registryContext: PluginContext | undefined;
+let registryUpdate: Promise<void> = Promise.resolve();
+const pendingCompanyIds = new Set<string>();
+
+async function readConfiguredCompanyIds(ctx: PluginContext): Promise<string[]> {
+  const value = await ctx.state.get(COMPANY_REGISTRY);
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !id.trim())) {
+    throw new Error("Invalid TTL sweep company registry.");
+  }
+  return [...new Set(value as string[])];
+}
+
 const plugin = definePlugin({
+  multiCompanyConfig: true,
+  async onConfigChanged(_config, context) {
+    const companyId = context?.companyId;
+    if (typeof companyId !== "string" || !companyId.trim()) return;
+    const ctx = registryContext;
+    if (!ctx) throw new Error("TTL sweep registry is not initialized.");
+    // Serialize deliveries and retain failed registrations until persisted,
+    // even when the next callback belongs to a different company.
+    pendingCompanyIds.add(companyId);
+    registryUpdate = registryUpdate.catch(() => {}).then(async () => {
+      const companyIds = await readConfiguredCompanyIds(ctx);
+      const pending = [...pendingCompanyIds];
+      const registered = [...new Set([...companyIds, ...pending])];
+      if (registered.length !== companyIds.length) {
+        await ctx.state.set(COMPANY_REGISTRY, registered);
+      }
+      for (const id of pending) pendingCompanyIds.delete(id);
+    }).catch(() => {
+      throw new Error("TTL sweep company registry update failed.");
+    });
+    await registryUpdate;
+  },
   async setup(ctx: PluginContext) {
+    registryContext = ctx;
+    registryUpdate = Promise.resolve();
+    pendingCompanyIds.clear();
     ctx.tools.register(
       PROVISION_TOOL,
       {
@@ -133,18 +175,39 @@ const plugin = definePlugin({
     );
 
     ctx.jobs.register(SWEEP_JOB_KEY, async () => {
-      for (const company of await ctx.companies.list()) {
+      // Cron jobs carry no companyId. The SDK's onConfigChanged scope metadata
+      // identifies companies authorized for proactive calls with explicit IDs.
+      let companyIds: string[];
+      try {
+        await registryUpdate;
+        companyIds = await readConfiguredCompanyIds(ctx);
+      } catch {
+        throw new Error("TTL sweep company registry unavailable.");
+      }
+      if (companyIds.length === 0) throw new Error("TTL sweep has not received any company configuration.");
+      let failures = 0;
+      for (const companyId of companyIds) {
         try {
-          const config = resolveConfig(await ctx.config.get(company.id));
+          const config = resolveConfig(await ctx.config.get(companyId));
           if (!config.tokenSecretRef || !config.accountId) continue; // Unconfigured: fail closed.
-          const result = await sweep(ctx, config, company.id, {
+          const result = await sweep(ctx, config, companyId, {
             fetchImpl: (url, init) => ctx.http.fetch(url, init),
           });
-          ctx.logger.info("cf-test-env sweep finished", { companyId: company.id, ...result });
-        } catch (err) {
-          ctx.logger.error("cf-test-env sweep failed", { companyId: company.id, error: String(err) });
+          const counts = { companyId, checked: result.checked, tornDown: result.tornDown.length, errors: result.errors.length };
+          if (result.errors.length > 0) {
+            failures += 1;
+            ctx.logger.error("cf-test-env sweep incomplete", counts);
+          } else {
+            ctx.logger.info("cf-test-env sweep finished", counts);
+          }
+        } catch {
+          failures += 1;
+          ctx.logger.error("cf-test-env sweep failed", { companyId });
         }
       }
+      // Keep other companies independent, but never report failed cleanup as a
+      // successful job. Raw config/transport errors must not reach logs or jobs.
+      if (failures > 0) throw new Error(`TTL sweep failed for ${failures} configured companies.`);
     });
 
     // Auto-teardown reads the card's authoritative status (not the event

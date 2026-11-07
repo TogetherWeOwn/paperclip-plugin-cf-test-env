@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
+
+- Hourly cleanup uses company IDs delivered through the SDK configuration
+  lifecycle, not global company enumeration from a scope-less cron job.
+  Company IDs persist in plugin-owned state so automatic worker recovery does
+  not disable cleanup; overlapping configuration deliveries are serialized.
+  Failed registrations remain pending across later callbacks from any company.
+  Config is refreshed per company at sweep time. Missing/corrupt registration
+  and incomplete cleanup fail the job instead of silently reporting success;
+  other configured companies still get their cleanup attempt. The unused
+  `companies.read` capability is removed.
 
 - Minted-token verification compares canonical CIDRs, not raw strings:
   Cloudflare may store the token `request.ip` condition with the IPv6
