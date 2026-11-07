@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { allEnvs } from "./envs.js";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest, { D1_EXECUTE_TOOL, PROVISION_TOOL, SWEEP_JOB_KEY, TEARDOWN_TOOL } from "./manifest.js";
 import plugin from "./plugin.js";
@@ -17,7 +18,12 @@ const config = {
   r2ItemWriteGroupId: "grp-r2-item-write",
 };
 
-async function setup() {
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+async function setup({ replayConfig = true } = {}) {
   const harness = createTestHarness({
     manifest,
     config,
@@ -25,6 +31,7 @@ async function setup() {
   });
   harness.seed({ companies: [{ id: COMPANY, name: "TWO", issuePrefix: "TWO" } as never] });
   await plugin.definition.setup(harness.ctx);
+  if (replayConfig) await plugin.definition.onConfigChanged?.(config, { companyId: COMPANY });
   const fake = new FakeCf();
   (harness.ctx.http as { fetch: unknown }).fetch = fake.fetch;
   (harness.ctx.secrets as { resolve: unknown }).resolve = async () => "mint-token";
@@ -59,6 +66,8 @@ describe("plugin wiring", () => {
         "plugin.state.write",
       ]),
     );
+    expect(manifest.capabilities).not.toContain("companies.read");
+    expect(plugin.definition.multiCompanyConfig).toBe(true);
     expect((manifest.tools ?? []).map((t) => t.name).sort()).toEqual(
       [D1_EXECUTE_TOOL, PROVISION_TOOL, TEARDOWN_TOOL].sort(),
     );
@@ -170,6 +179,96 @@ describe("plugin wiring", () => {
     await harness.emit("issue.updated", {}, { entityId: issue.id, companyId: COMPANY });
     expect(fake.scripts.size).toBe(0);
     expect(fake.revokedTokens).toHaveLength(1);
+  });
+
+  it("the hourly sweep reaps expired envs without global company enumeration", async () => {
+    const { harness, fake, issue, run } = await setup();
+    const now = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now - 5 * 3600 * 1000);
+    const expired = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run));
+    vi.setSystemTime(now);
+    const live = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run));
+    // A cron invocation has no companyId. Model the host rejecting wildcard
+    // enumeration while another company invocation is active.
+    const list = vi.spyOn(harness.ctx.companies, "list").mockRejectedValue(new Error("missing invocation scope"));
+    await expect(harness.runJob(SWEEP_JOB_KEY, { trigger: "schedule" })).resolves.toBeUndefined();
+    expect(list).not.toHaveBeenCalled();
+    expect(fake.scripts.has(expired.workerName)).toBe(false);
+    expect(fake.scripts.has(live.workerName)).toBe(true);
+    expect(fake.revokedTokens).toHaveLength(1);
+    expect((await allEnvs(harness.ctx, COMPANY)).map((env) => env.envId)).toEqual([live.envId]);
+  });
+
+  it("refuses to sweep before company config replay without resolving credentials", async () => {
+    const { harness } = await setup({ replayConfig: false });
+    const getConfig = vi.spyOn(harness.ctx.config, "get");
+    const resolveSecret = vi.spyOn(harness.ctx.secrets, "resolve");
+    await plugin.definition.onConfigChanged?.(config);
+    await plugin.definition.onConfigChanged?.(config, { companyId: null });
+    await plugin.definition.onConfigChanged?.(config, { companyId: "  " });
+    await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("has not received any company configuration");
+    expect(getConfig).not.toHaveBeenCalled();
+    expect(resolveSecret).not.toHaveBeenCalled();
+  });
+
+  it("sweeps each configured company once with explicit company-scoped state", async () => {
+    const { harness } = await setup();
+    await plugin.definition.onConfigChanged?.(config, { companyId: COMPANY });
+    await plugin.definition.onConfigChanged?.(config, { companyId: "c-2" });
+    await plugin.definition.onConfigChanged?.(config, { companyId: null });
+    const getConfig = vi.spyOn(harness.ctx.config, "get");
+    const getState = vi.spyOn(harness.ctx.state, "get");
+    const resolveSecret = vi.spyOn(harness.ctx.secrets, "resolve");
+    const list = vi.spyOn(harness.ctx.companies, "list").mockRejectedValue(new Error("missing invocation scope"));
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(getConfig.mock.calls).toEqual([[COMPANY], ["c-2"]]);
+    expect(getState.mock.calls.map(([key]) => key)).toEqual([
+      { scopeKind: "company", scopeId: COMPANY, stateKey: "cf-test-env:index" },
+      { scopeKind: "company", scopeId: "c-2", stateKey: "cf-test-env:index" },
+    ]);
+    expect(list).not.toHaveBeenCalled();
+    expect(resolveSecret).not.toHaveBeenCalled();
+  });
+
+  it("reads fresh config and skips disabled companies without touching state or secrets", async () => {
+    const { harness } = await setup();
+    harness.setConfig({});
+    await plugin.definition.onConfigChanged?.({}, { companyId: COMPANY });
+    const getState = vi.spyOn(harness.ctx.state, "get");
+    const resolveSecret = vi.spyOn(harness.ctx.secrets, "resolve");
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(getState).not.toHaveBeenCalled();
+    expect(resolveSecret).not.toHaveBeenCalled();
+  });
+
+  it("continues other companies after a failure but reports the job failed without raw errors", async () => {
+    const { harness } = await setup();
+    await plugin.definition.onConfigChanged?.(config, { companyId: "c-2" });
+    const secretError = "credential-do-not-log";
+    const getConfig = vi.spyOn(harness.ctx.config, "get").mockImplementation(async (companyId) => {
+      if (companyId === COMPANY) throw new Error(secretError);
+      return config;
+    });
+    const errorLog = vi.spyOn(harness.ctx.logger, "error");
+    const infoLog = vi.spyOn(harness.ctx.logger, "info");
+    await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("TTL sweep failed for 1 configured companies.");
+    expect(getConfig.mock.calls).toEqual([[COMPANY], ["c-2"]]);
+    expect(infoLog).toHaveBeenCalledWith("cf-test-env sweep finished", {
+      companyId: "c-2", checked: 0, tornDown: 0, errors: 0,
+    });
+    expect(errorLog).toHaveBeenCalledWith("cf-test-env sweep failed", { companyId: COMPANY });
+    expect(JSON.stringify([...errorLog.mock.calls, ...infoLog.mock.calls])).not.toContain(secretError);
+  });
+
+  it("marks incomplete expiry cleanup as a failed job and retains the record for retry", async () => {
+    const { harness, fake, issue, run } = await setup();
+    const data = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 5 * 3600 * 1000);
+    fake.failWithForbiddenOn = [`DELETE /accounts/acct-1/r2/buckets/${data.workerName}`];
+    await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("TTL sweep failed for 1 configured companies.");
+    expect((await allEnvs(harness.ctx, COMPANY)).map((env) => env.envId)).toEqual([data.envId]);
   });
 
   it("the hourly sweep keeps live envs (expiry paths are covered in envs.test.ts)", async () => {

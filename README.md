@@ -83,6 +83,31 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
   R2 writes. Provision/teardown empty and delete buckets with the minting
   credential, which is unaffected.
 
+## Scheduled cleanup and company scope
+
+Cron job contexts do not contain a company ID. The worker opts into the SDK's
+`multiCompanyConfig` lifecycle and records only the company IDs delivered to
+`onConfigChanged(config, { companyId })`. Paperclip replays stored company
+configuration after startup and delivers later operator saves through that hook.
+The hourly job snapshots those IDs and refreshes `ctx.config.get(companyId)`;
+company state, issue lookups and secret resolution also pass explicit company IDs.
+It never enumerates all companies or infers one from an agent's active invocation.
+
+This follows the `PluginConfigChangeContext` / `PluginDefinition` contract in
+`@paperclipai/plugin-sdk` (2026.1023.0 and 2026.1106.0,
+`dist/define-plugin.d.ts`, sections `multiCompanyConfig` and `onConfigChanged`).
+The 2026.1106.0 host's `plugin-loader` seeds proactive authorization from the
+plugin's configured companies and replays their `configChanged` messages.
+No new capability or SDK upgrade is required.
+
+A job that runs before any company configuration has arrived fails without
+reading state or resolving credentials. A configured company with an empty
+account or secret reference is skipped, as before. A company failure does not
+stop other companies from being attempted, but any failed/incomplete cleanup
+marks the job failed. Job errors and sweep logs expose counts, not raw
+configuration or transport errors. After an operator upgrade, verify a scheduled
+hourly run, not only a manual tool call; failed cleanup remains tracked for retry.
+
 ## Development
 
 ```sh

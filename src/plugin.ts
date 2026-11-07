@@ -16,8 +16,19 @@ function toolError(err: unknown): { error: string; data: { error: { message: str
   return { error: message, data: { error: { message } }, content: `Error: ${message}` };
 }
 
+// The host replays stored company configs after startup. Keep only their IDs,
+// not credentials or config snapshots; each sweep reads the current config.
+const configuredCompanyIds = new Set<string>();
+
 const plugin = definePlugin({
+  multiCompanyConfig: true,
+  async onConfigChanged(_config, context) {
+    if (typeof context?.companyId === "string" && context.companyId.trim()) {
+      configuredCompanyIds.add(context.companyId);
+    }
+  },
   async setup(ctx: PluginContext) {
+    configuredCompanyIds.clear();
     ctx.tools.register(
       PROVISION_TOOL,
       {
@@ -133,18 +144,33 @@ const plugin = definePlugin({
     );
 
     ctx.jobs.register(SWEEP_JOB_KEY, async () => {
-      for (const company of await ctx.companies.list()) {
+      // Cron jobs carry no companyId. The SDK's onConfigChanged scope metadata
+      // identifies companies authorized for proactive calls with explicit IDs.
+      const companyIds = [...configuredCompanyIds];
+      if (companyIds.length === 0) throw new Error("TTL sweep has not received any company configuration.");
+      let failures = 0;
+      for (const companyId of companyIds) {
         try {
-          const config = resolveConfig(await ctx.config.get(company.id));
+          const config = resolveConfig(await ctx.config.get(companyId));
           if (!config.tokenSecretRef || !config.accountId) continue; // Unconfigured: fail closed.
-          const result = await sweep(ctx, config, company.id, {
+          const result = await sweep(ctx, config, companyId, {
             fetchImpl: (url, init) => ctx.http.fetch(url, init),
           });
-          ctx.logger.info("cf-test-env sweep finished", { companyId: company.id, ...result });
-        } catch (err) {
-          ctx.logger.error("cf-test-env sweep failed", { companyId: company.id, error: String(err) });
+          const counts = { companyId, checked: result.checked, tornDown: result.tornDown.length, errors: result.errors.length };
+          if (result.errors.length > 0) {
+            failures += 1;
+            ctx.logger.error("cf-test-env sweep incomplete", counts);
+          } else {
+            ctx.logger.info("cf-test-env sweep finished", counts);
+          }
+        } catch {
+          failures += 1;
+          ctx.logger.error("cf-test-env sweep failed", { companyId });
         }
       }
+      // Keep other companies independent, but never report failed cleanup as a
+      // successful job. Raw config/transport errors must not reach logs or jobs.
+      if (failures > 0) throw new Error(`TTL sweep failed for ${failures} configured companies.`);
     });
 
     // Auto-teardown reads the card's authoritative status (not the event
