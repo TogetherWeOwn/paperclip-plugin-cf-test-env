@@ -4,8 +4,10 @@
 
 - Hourly cleanup uses company IDs delivered through the SDK configuration
   lifecycle, not global company enumeration from a scope-less cron job.
-  Config is refreshed per company at sweep time. Missing startup replay and
-  incomplete cleanup fail the job instead of silently reporting success;
+  Company IDs persist in plugin-owned state so automatic worker recovery does
+  not disable cleanup; overlapping configuration deliveries are serialized.
+  Config is refreshed per company at sweep time. Missing/corrupt registration
+  and incomplete cleanup fail the job instead of silently reporting success;
   other configured companies still get their cleanup attempt. The unused
   `companies.read` capability is removed.
 

@@ -88,8 +88,12 @@ token broker (900 s cap, no issue context), a separate Cloudflare account.
 Cron job contexts do not contain a company ID. The worker opts into the SDK's
 `multiCompanyConfig` lifecycle and records only the company IDs delivered to
 `onConfigChanged(config, { companyId })`. Paperclip replays stored company
-configuration after startup and delivers later operator saves through that hook.
-The hourly job snapshots those IDs and refreshes `ctx.config.get(companyId)`;
+configuration on activation and delivers later operator saves through that hook.
+Automatic worker crash recovery does not replay those configurations, so the
+registry is persisted in plugin-owned instance state (`cf-test-env:companies`)
+and concurrent registrations are serialized. It contains no configuration values
+or credentials and confers no authority: the host still checks each company call.
+The hourly job reads those persisted IDs and refreshes `ctx.config.get(companyId)`;
 company state, issue lookups and secret resolution also pass explicit company IDs.
 It never enumerates all companies or infers one from an agent's active invocation.
 
@@ -100,9 +104,9 @@ The 2026.1106.0 host's `plugin-loader` seeds proactive authorization from the
 plugin's configured companies and replays their `configChanged` messages.
 No new capability or SDK upgrade is required.
 
-A job that runs before any company configuration has arrived fails without
-reading state or resolving credentials. A configured company with an empty
-account or secret reference is skipped, as before. A company failure does not
+A job with no persisted company registration, or an unreadable/corrupt registry,
+fails without reading company state or resolving credentials. A configured company
+with an empty account or secret reference is skipped, as before. A company failure does not
 stop other companies from being attempted, but any failed/incomplete cleanup
 marks the job failed. Job errors and sweep logs expose counts, not raw
 configuration or transport errors. After an operator upgrade, verify a scheduled

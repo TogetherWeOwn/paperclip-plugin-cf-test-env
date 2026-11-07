@@ -200,6 +200,22 @@ describe("plugin wiring", () => {
     expect((await allEnvs(harness.ctx, COMPANY)).map((env) => env.envId)).toEqual([live.envId]);
   });
 
+  it("recovers hourly cleanup after worker restart without configuration replay", async () => {
+    const { harness, fake, issue, run } = await setup();
+    const data = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 5 * 3600 * 1000);
+    // Automatic worker recovery initializes again with persisted plugin state,
+    // but unlike activation it does not replay company configuration.
+    await plugin.definition.setup(harness.ctx);
+    const list = vi.spyOn(harness.ctx.companies, "list").mockRejectedValue(new Error("missing invocation scope"));
+    await expect(harness.runJob(SWEEP_JOB_KEY)).resolves.toBeUndefined();
+    expect(list).not.toHaveBeenCalled();
+    expect(fake.scripts.has(data.workerName)).toBe(false);
+    expect(fake.revokedTokens).toHaveLength(1);
+    expect(await allEnvs(harness.ctx, COMPANY)).toEqual([]);
+  });
+
   it("refuses to sweep before company config replay without resolving credentials", async () => {
     const { harness } = await setup({ replayConfig: false });
     const getConfig = vi.spyOn(harness.ctx.config, "get");
@@ -223,7 +239,7 @@ describe("plugin wiring", () => {
     const list = vi.spyOn(harness.ctx.companies, "list").mockRejectedValue(new Error("missing invocation scope"));
     await harness.runJob(SWEEP_JOB_KEY);
     expect(getConfig.mock.calls).toEqual([[COMPANY], ["c-2"]]);
-    expect(getState.mock.calls.map(([key]) => key)).toEqual([
+    expect(getState.mock.calls.map(([key]) => key).filter((key) => key.scopeKind === "company")).toEqual([
       { scopeKind: "company", scopeId: COMPANY, stateKey: "cf-test-env:index" },
       { scopeKind: "company", scopeId: "c-2", stateKey: "cf-test-env:index" },
     ]);
@@ -231,15 +247,76 @@ describe("plugin wiring", () => {
     expect(resolveSecret).not.toHaveBeenCalled();
   });
 
-  it("reads fresh config and skips disabled companies without touching state or secrets", async () => {
+  it("reads fresh config and skips disabled companies without touching company state or secrets", async () => {
     const { harness } = await setup();
     harness.setConfig({});
     await plugin.definition.onConfigChanged?.({}, { companyId: COMPANY });
     const getState = vi.spyOn(harness.ctx.state, "get");
     const resolveSecret = vi.spyOn(harness.ctx.secrets, "resolve");
     await harness.runJob(SWEEP_JOB_KEY);
-    expect(getState).not.toHaveBeenCalled();
+    expect(getState.mock.calls).toEqual([[{ scopeKind: "instance", stateKey: "cf-test-env:companies" }]]);
     expect(resolveSecret).not.toHaveBeenCalled();
+  });
+
+  it("persists concurrent company registrations without losing entries", async () => {
+    const { harness } = await setup();
+    await Promise.all([
+      plugin.definition.onConfigChanged?.(config, { companyId: "c-2" }),
+      plugin.definition.onConfigChanged?.(config, { companyId: "c-3" }),
+      plugin.definition.onConfigChanged?.(config, { companyId: COMPANY }),
+    ]);
+    expect(await harness.ctx.state.get({ scopeKind: "instance", stateKey: "cf-test-env:companies" }))
+      .toEqual([COMPANY, "c-2", "c-3"]);
+  });
+
+  it("refuses a corrupt persistent registry before company config or secret access", async () => {
+    const { harness } = await setup();
+    await harness.ctx.state.set({ scopeKind: "instance", stateKey: "cf-test-env:companies" }, [COMPANY, null]);
+    const getConfig = vi.spyOn(harness.ctx.config, "get");
+    const resolveSecret = vi.spyOn(harness.ctx.secrets, "resolve");
+    await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("company registry unavailable");
+    expect(getConfig).not.toHaveBeenCalled();
+    expect(resolveSecret).not.toHaveBeenCalled();
+  });
+
+  it("fails closed after a registry write failure and permits a later config replay to retry", async () => {
+    const { harness } = await setup();
+    vi.spyOn(harness.ctx.state, "set").mockRejectedValueOnce(new Error("credential-do-not-log"));
+    await expect(plugin.definition.onConfigChanged?.(config, { companyId: "c-2" }))
+      .rejects.toThrow("company registry update failed");
+    await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("company registry unavailable");
+    await plugin.definition.onConfigChanged?.(config, { companyId: "c-2" });
+    await expect(harness.runJob(SWEEP_JOB_KEY)).resolves.toBeUndefined();
+    expect(await harness.ctx.state.get({ scopeKind: "instance", stateKey: "cf-test-env:companies" }))
+      .toEqual([COMPANY, "c-2"]);
+  });
+
+  it("uses each company's own config and secret when reaping populated environments", async () => {
+    const { harness, fake, issue, run } = await setup();
+    const secondConfig = { ...config, accountId: "acct-2", tokenSecretRef: { type: "secret_ref", secretId: "s-2" } };
+    vi.spyOn(harness.ctx.config, "get").mockImplementation(async (companyId) => companyId === COMPANY ? config : secondConfig);
+    const secondIssue = await harness.ctx.issues.create({
+      companyId: "c-2", title: "second card", projectId: PROJ, assigneeAgentId: AGENT,
+    });
+    await plugin.definition.onConfigChanged?.(secondConfig, { companyId: "c-2" });
+    const first = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, run));
+    const second = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: secondIssue.id }, { ...run, companyId: "c-2" }));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 5 * 3600 * 1000);
+    const resolveSecret = vi.spyOn(harness.ctx.secrets, "resolve");
+    const callsBefore = fake.calls.length;
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(resolveSecret.mock.calls).toEqual([
+      [config.tokenSecretRef, { companyId: COMPANY }],
+      [secondConfig.tokenSecretRef, { companyId: "c-2" }],
+    ]);
+    const deletes = fake.calls.slice(callsBefore).filter((call) => call.method === "DELETE");
+    expect(deletes.some((call) => call.path === `/accounts/acct-1/workers/scripts/${first.workerName}`)).toBe(true);
+    expect(deletes.some((call) => call.path === `/accounts/acct-2/workers/scripts/${second.workerName}`)).toBe(true);
+    expect(deletes.some((call) => call.path === `/accounts/acct-1/workers/scripts/${second.workerName}`)).toBe(false);
+    expect(deletes.some((call) => call.path === `/accounts/acct-2/workers/scripts/${first.workerName}`)).toBe(false);
+    expect(await allEnvs(harness.ctx, COMPANY)).toEqual([]);
+    expect(await allEnvs(harness.ctx, "c-2")).toEqual([]);
   });
 
   it("continues other companies after a failure but reports the job failed without raw errors", async () => {

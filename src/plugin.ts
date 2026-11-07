@@ -16,19 +16,44 @@ function toolError(err: unknown): { error: string; data: { error: { message: str
   return { error: message, data: { error: { message } }, content: `Error: ${message}` };
 }
 
-// The host replays stored company configs after startup. Keep only their IDs,
-// not credentials or config snapshots; each sweep reads the current config.
-const configuredCompanyIds = new Set<string>();
+// Activation replays company configs, but automatic worker recovery does not.
+// Persist only IDs in plugin-owned instance state; the host still authorizes
+// every company-scoped call, and each sweep reads current config, not a snapshot.
+const COMPANY_REGISTRY = { scopeKind: "instance" as const, stateKey: "cf-test-env:companies" };
+let registryContext: PluginContext | undefined;
+let registryUpdate: Promise<void> = Promise.resolve();
+
+async function readConfiguredCompanyIds(ctx: PluginContext): Promise<string[]> {
+  const value = await ctx.state.get(COMPANY_REGISTRY);
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !id.trim())) {
+    throw new Error("Invalid TTL sweep company registry.");
+  }
+  return [...new Set(value as string[])];
+}
 
 const plugin = definePlugin({
   multiCompanyConfig: true,
   async onConfigChanged(_config, context) {
-    if (typeof context?.companyId === "string" && context.companyId.trim()) {
-      configuredCompanyIds.add(context.companyId);
-    }
+    const companyId = context?.companyId;
+    if (typeof companyId !== "string" || !companyId.trim()) return;
+    const ctx = registryContext;
+    if (!ctx) throw new Error("TTL sweep registry is not initialized.");
+    // Serialize overlapping config deliveries so one company cannot overwrite
+    // another's registration. A later delivery may retry a failed state write.
+    registryUpdate = registryUpdate.catch(() => {}).then(async () => {
+      const companyIds = await readConfiguredCompanyIds(ctx);
+      if (!companyIds.includes(companyId)) {
+        await ctx.state.set(COMPANY_REGISTRY, [...companyIds, companyId]);
+      }
+    }).catch(() => {
+      throw new Error("TTL sweep company registry update failed.");
+    });
+    await registryUpdate;
   },
   async setup(ctx: PluginContext) {
-    configuredCompanyIds.clear();
+    registryContext = ctx;
+    registryUpdate = Promise.resolve();
     ctx.tools.register(
       PROVISION_TOOL,
       {
@@ -146,7 +171,13 @@ const plugin = definePlugin({
     ctx.jobs.register(SWEEP_JOB_KEY, async () => {
       // Cron jobs carry no companyId. The SDK's onConfigChanged scope metadata
       // identifies companies authorized for proactive calls with explicit IDs.
-      const companyIds = [...configuredCompanyIds];
+      let companyIds: string[];
+      try {
+        await registryUpdate;
+        companyIds = await readConfiguredCompanyIds(ctx);
+      } catch {
+        throw new Error("TTL sweep company registry unavailable.");
+      }
       if (companyIds.length === 0) throw new Error("TTL sweep has not received any company configuration.");
       let failures = 0;
       for (const companyId of companyIds) {
