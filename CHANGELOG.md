@@ -6,6 +6,7 @@
   lifecycle, not global company enumeration from a scope-less cron job.
   Company IDs persist in plugin-owned state so automatic worker recovery does
   not disable cleanup; overlapping configuration deliveries are serialized.
+  Failed registrations remain pending across later callbacks from any company.
   Config is refreshed per company at sweep time. Missing/corrupt registration
   and incomplete cleanup fail the job instead of silently reporting success;
   other configured companies still get their cleanup attempt. The unused

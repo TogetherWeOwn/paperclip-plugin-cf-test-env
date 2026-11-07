@@ -207,7 +207,9 @@ describe("plugin wiring", () => {
     vi.setSystemTime(Date.now() + 5 * 3600 * 1000);
     // Automatic worker recovery initializes again with persisted plugin state,
     // but unlike activation it does not replay company configuration.
-    await plugin.definition.setup(harness.ctx);
+    vi.resetModules();
+    const { default: recoveredPlugin } = await import("./plugin.js");
+    await recoveredPlugin.definition.setup(harness.ctx);
     const list = vi.spyOn(harness.ctx.companies, "list").mockRejectedValue(new Error("missing invocation scope"));
     await expect(harness.runJob(SWEEP_JOB_KEY)).resolves.toBeUndefined();
     expect(list).not.toHaveBeenCalled();
@@ -287,6 +289,27 @@ describe("plugin wiring", () => {
     await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("company registry unavailable");
     await plugin.definition.onConfigChanged?.(config, { companyId: "c-2" });
     await expect(harness.runJob(SWEEP_JOB_KEY)).resolves.toBeUndefined();
+    expect(await harness.ctx.state.get({ scopeKind: "instance", stateKey: "cf-test-env:companies" }))
+      .toEqual([COMPANY, "c-2"]);
+  });
+
+  it("retries failed company registration before accepting another company's callback", async () => {
+    const { harness, fake, run } = await setup();
+    const issue = await harness.ctx.issues.create({
+      companyId: "c-2", title: "second card", projectId: PROJ, assigneeAgentId: AGENT,
+    });
+    const data = toolData(await harness.executeTool(PROVISION_TOOL, { issueId: issue.id }, { ...run, companyId: "c-2" }));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 5 * 3600 * 1000);
+    vi.spyOn(harness.ctx.state, "set").mockRejectedValueOnce(new Error("credential-do-not-log"));
+    await expect(plugin.definition.onConfigChanged?.(config, { companyId: "c-2" }))
+      .rejects.toThrow("company registry update failed");
+    await expect(harness.runJob(SWEEP_JOB_KEY)).rejects.toThrow("company registry unavailable");
+    await plugin.definition.onConfigChanged?.(config, { companyId: COMPANY });
+    await expect(harness.runJob(SWEEP_JOB_KEY)).resolves.toBeUndefined();
+    expect(fake.scripts.has(data.workerName)).toBe(false);
+    expect(fake.revokedTokens).toHaveLength(1);
+    expect(await allEnvs(harness.ctx, "c-2")).toEqual([]);
     expect(await harness.ctx.state.get({ scopeKind: "instance", stateKey: "cf-test-env:companies" }))
       .toEqual([COMPANY, "c-2"]);
   });

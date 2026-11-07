@@ -22,6 +22,7 @@ function toolError(err: unknown): { error: string; data: { error: { message: str
 const COMPANY_REGISTRY = { scopeKind: "instance" as const, stateKey: "cf-test-env:companies" };
 let registryContext: PluginContext | undefined;
 let registryUpdate: Promise<void> = Promise.resolve();
+const pendingCompanyIds = new Set<string>();
 
 async function readConfiguredCompanyIds(ctx: PluginContext): Promise<string[]> {
   const value = await ctx.state.get(COMPANY_REGISTRY);
@@ -39,13 +40,17 @@ const plugin = definePlugin({
     if (typeof companyId !== "string" || !companyId.trim()) return;
     const ctx = registryContext;
     if (!ctx) throw new Error("TTL sweep registry is not initialized.");
-    // Serialize overlapping config deliveries so one company cannot overwrite
-    // another's registration. A later delivery may retry a failed state write.
+    // Serialize deliveries and retain failed registrations until persisted,
+    // even when the next callback belongs to a different company.
+    pendingCompanyIds.add(companyId);
     registryUpdate = registryUpdate.catch(() => {}).then(async () => {
       const companyIds = await readConfiguredCompanyIds(ctx);
-      if (!companyIds.includes(companyId)) {
-        await ctx.state.set(COMPANY_REGISTRY, [...companyIds, companyId]);
+      const pending = [...pendingCompanyIds];
+      const registered = [...new Set([...companyIds, ...pending])];
+      if (registered.length !== companyIds.length) {
+        await ctx.state.set(COMPANY_REGISTRY, registered);
       }
+      for (const id of pending) pendingCompanyIds.delete(id);
     }).catch(() => {
       throw new Error("TTL sweep company registry update failed.");
     });
@@ -54,6 +59,7 @@ const plugin = definePlugin({
   async setup(ctx: PluginContext) {
     registryContext = ctx;
     registryUpdate = Promise.resolve();
+    pendingCompanyIds.clear();
     ctx.tools.register(
       PROVISION_TOOL,
       {
