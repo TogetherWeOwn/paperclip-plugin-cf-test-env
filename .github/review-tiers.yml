@@ -1,0 +1,55 @@
+# The highest changed-file tier wins; sensitive wins overlaps and unmatched
+# paths are sensitive. This map itself is always sensitive. Every PR receives
+# QA; sensitive, unclassified or escalated changes receive Security then QA.
+# The author attests the tier and QA verifies the map and the diff.
+#
+# Content always escalates to sensitive, regardless of path: new or changed
+# public endpoints or input parsing; auth, authz or sessions; crypto or key
+# handling; secrets or credentials; permission checks; tenant isolation or
+# personal data; SQL, schema or migrations; dependencies and lockfiles,
+# including development dependencies; CI or workflows; weakened assertions,
+# deleted tests or snapshots, or lowered test gates. Test globs are low only
+# for additive tests and never exempt test weakening from escalation.
+#
+# The sensitive floor includes review policy, ownership and rulesets, build and
+# dependency configuration, runtime/network/IAM/deployment and persistence,
+# and agent instructions, skills and tool permissions. Moving a floor glob to
+# a lower tier requires explicit Security approval on that PR. New paths are
+# sensitive unless explicitly allowlisted; when in doubt, escalate.
+version: 1
+default_tier: sensitive
+tiers:
+  low:
+    # Existing prose and license only, not broad documentation directories.
+    - README.md
+    - CHANGELOG.md
+    - LICENSE
+    # Additive unit tests only; the content triggers above still apply.
+    - src/*.test.ts
+  # No runtime module has been audited as free of input, sensitive output,
+  # permissions, persistence and trust-boundary effects.
+  ordinary: []
+  sensitive:
+    - .github/**
+    - CODEOWNERS
+    - package.json
+    - package-lock.json
+    - tsconfig*.json
+    - vitest.config.ts
+    - Makefile
+    - Dockerfile*
+    - scripts/**
+    - AGENTS.md
+    - '**/AGENTS.md'
+    - .claude/**
+    - skills/**
+    # Runtime code provisions and scopes Cloudflare resources and credentials.
+    - src/cloudflare.ts
+    - src/config.ts
+    - src/envs.ts
+    - src/index.ts
+    - src/manifest.ts
+    - src/plugin.ts
+    - src/scoping.ts
+    - src/worker.ts
+    - src/test-support/**
